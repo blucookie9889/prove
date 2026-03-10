@@ -1,26 +1,114 @@
-/* 1. Reset: toglie i margini automatici brutti del browser */
+/* 1. RESET TOTALE - Toglie i margini brutti di default dei browser */
 * {
     margin: 0;
     padding: 0;
     box-sizing: border-box;
 }
 
-/* 2. Stile della pagina */
 body {
-    font-family: 'Helvetica', sans-serif;
-    padding: 40px;
-    background-color: #f4f4f4;
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    background-color: #f5f5f7; /* Grigio chiarissimo stile Apple */
+    color: #1d1d1f;
 }
 
-/* 3. Stile del Titolo */
-h1 {
-    color: #007AFF; /* Blu Apple */
-    margin-bottom: 20px;
+/* 2. NAVBAR - La barra in alto */
+.navbar {
+    display: flex;
+    justify-content: space-between;
+    padding: 20px 5%;
+    background: rgba(255, 255, 255, 0.8);
+    backdrop-filter:  blur(10px); /* Effetto vetro sfocato */
+    position: sticky;
+    top: 0;
+    z-index: 1000;
 }
 
-/* 4. Stile dei Paragrafi */
-p {
+.logo {
+    font-size: 20px;
+    font-weight: bold;
+    color: #007AFF;
+}
+
+.nav-links {
+    display: flex;
+    list-style: none;
+    gap: 25px;
+    align-items: center;
+}
+
+.nav-links a {
+    text-decoration: none;
     color: #333;
-    margin-bottom: 10px; /* Qui controlli lo spazio tra i p */
-    font-size: 16px;
+    font-size: 14px;
+    transition: 0.3s;
 }
+
+.nav-links a:hover {
+    color: #007AFF;
+}
+
+.nav-btn {
+    background-color: #007AFF;
+    color: white !important;
+    padding: 8px 18px;
+    border-radius: 20px;
+}
+
+/* 3. HERO SECTION - La parte alta con l'immagine */
+.hero {
+    height: 70vh;
+    background: linear-gradient(rgba(0,0,0,0.4), rgba(0,0,0,0.4)), 
+                url('https://images.unsplash.com/photo-1498050108023-c5249f4df085?ixlib=rb-1.2.1&auto=format&fit=crop&w=1352&q=80');
+    background-size: cover;
+    background-position: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    text-align: center;
+}
+
+.hero h1 { font-size: 48px; margin-bottom: 10px; }
+
+.btn {
+    display: inline-block;
+    margin-top: 25px;
+    padding: 15px 30px;
+    background-color: #007AFF;
+    color: white;
+    text-decoration: none;
+    border-radius: 30px;
+    font-weight: bold;
+    transition: 0.3s;
+}
+
+.btn:hover { transform: scale(1.05); }
+
+/* 4. SERVICES - Le 3 schede */
+.services {
+    padding: 80px 5%;
+    text-align: center;
+}
+
+.card-container {
+    display: flex;
+    justify-content: center;
+    gap: 30px;
+    flex-wrap: wrap; /* Fa andare a capo le card su iPhone */
+    margin-top: 40px;
+}
+
+.card {
+    background: white;
+    padding: 40px;
+    border-radius: 20px;
+    width: 320px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.05);
+    transition: 0.3s;
+}
+
+.card:hover {
+    transform: translateY(-10px);
+    box-shadow: 0 20px 40px rgba(red, green, blue, alpha); 
+    }
