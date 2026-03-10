@@ -1,0 +1,26 @@
+/* 1. Reset: toglie i margini automatici brutti del browser */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+/* 2. Stile della pagina */
+body {
+    font-family: 'Helvetica', sans-serif;
+    padding: 40px;
+    background-color: #f4f4f4;
+}
+
+/* 3. Stile del Titolo */
+h1 {
+    color: #007AFF; /* Blu Apple */
+    margin-bottom: 20px;
+}
+
+/* 4. Stile dei Paragrafi */
+p {
+    color: #333;
+    margin-bottom: 10px; /* Qui controlli lo spazio tra i p */
+    font-size: 16px;
+}
