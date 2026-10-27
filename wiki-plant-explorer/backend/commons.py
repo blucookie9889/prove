@@ -77,15 +77,18 @@ class Commons:
         self.http = httpx.AsyncClient(
             headers={"User-Agent": USER_AGENT}, follow_redirects=True, timeout=30
         )
-        self.image_sem = asyncio.Semaphore(4)  # Wikimedia answers 429 above a few parallel fetches
+        # Per image host: Wikimedia answers 429 above a few parallel fetches; other hosts get their own.
+        self.image_sems: dict = {}
         self._cache: dict = {}  # metadata responses only, kept CACHE_TTL_S; never images
 
     async def close(self) -> None:
         await self.http.aclose()
 
     async def _get(self, url: str, **params) -> dict:
-        params.setdefault("format", "json")
-        params.setdefault("formatversion", 2)
+        """Cached GET of a JSON API (MediaWiki ones get format=json; also used by ``sources``)."""
+        if url.endswith("api.php"):
+            params.setdefault("format", "json")
+            params.setdefault("formatversion", 2)
         key = (url, tuple(sorted(params.items())))
         hit = self._cache.get(key)
         if hit and time.time() - hit[0] < CACHE_TTL_S:
@@ -120,6 +123,7 @@ class Commons:
             "page_url": info.get("descriptionurl"),
             "author": _text(meta.get("Artist", {}).get("value"))[:120],
             "license": _text(meta.get("LicenseShortName", {}).get("value")),
+            "source": "Wikimedia Commons",
         }
 
     _IMAGEINFO = {
@@ -273,7 +277,9 @@ class Commons:
     # ----------------------------------------------------------------- images (memory only)
 
     async def fetch_image(self, url: str) -> Image.Image:
-        async with self.image_sem:
+        host = httpx.URL(url).host
+        sem = self.image_sems.setdefault(host, asyncio.Semaphore(4 if "wikimedia" in host else 6))
+        async with sem:
             for attempt in range(4):
                 resp = await self.http.get(url)
                 if resp.status_code == 429:

@@ -7,8 +7,10 @@ const SUGGESTIONS = ["foglie", "texture", "architettura gotica", "minerali", "co
 const FIRST_BUDGET = 24;
 const REFINE_BUDGET = 64;
 const REFINE_ROUNDS = 3;
+// Similar images shown at first; scrolling down asks for this many more each time.
+const SIMILAR_PAGE = 60;
 // Search pages are shown at once, then checked with CLIP (up to this many new images per page).
-const SEARCH_BUDGET = 48;
+const SEARCH_BUDGET = 72;
 // Cards that get their own view-transition name, so they glide to their new place on re-rank.
 const ANIMATED_CARDS = 40;
 const TRAIL_KEY = "wiki-explorer-trail";
@@ -46,6 +48,7 @@ function readRoute() {
   const p = new URLSearchParams(window.location.search);
   if (p.get("file")) return { view: "file", file: p.get("file"), q: p.get("q") || "" };
   if (p.get("view") === "saved") return { view: "saved", q: "" };
+  if (p.get("view") === "featured") return { view: "featured", q: "" };
   if (p.get("q")) return { view: "search", q: p.get("q") };
   return { view: "feed", q: "" };
 }
@@ -55,7 +58,7 @@ function routeUrl(r) {
   if (r.view === "file") {
     p.set("file", r.file);
     if (r.q) p.set("q", r.q);
-  } else if (r.view === "saved") p.set("view", "saved");
+  } else if (r.view === "saved" || r.view === "featured") p.set("view", r.view);
   else if (r.view === "search") p.set("q", r.q);
   const s = p.toString();
   return s ? `?${s}` : window.location.pathname;
@@ -63,6 +66,7 @@ function routeUrl(r) {
 
 function bigThumb(item) {
   if (!item) return "";
+  if (!item.thumb.includes("upload.wikimedia.org")) return item.full || item.thumb; // museums, iNaturalist
   if (item.full_width && item.full_width <= 1280) return item.full;
   return item.thumb.replace(/\/\d+px-/, "/1280px-");
 }
@@ -169,7 +173,7 @@ function Header({ route, savedCount, onSearch, onHome, onSaved }) {
           <input
             value={text}
             onChange={(e) => setText(e.target.value)}
-            placeholder="Cerca su tutto Wikimedia Commons"
+            placeholder="Cerca tra milioni di immagini libere"
             className="h-12 w-full rounded-full bg-wash pr-4 pl-11 text-[15px] transition outline-none placeholder:text-mute focus:bg-white focus:shadow-[0_0_0_1px_rgba(0,0,0,0.08),0_8px_30px_-8px_rgba(0,0,0,0.18)]"
             enterKeyHint="search"
           />
@@ -233,6 +237,9 @@ function Card({ item, index, animated, onOpen, onSave, onVote, voting }) {
           } translate-y-1`}
         >
           {item.name}
+          {item.source && item.source !== "Wikimedia Commons" && (
+            <span className="mt-0.5 block text-[11px] font-normal text-white/75">{item.source}</span>
+          )}
         </span>
       </button>
 
@@ -335,6 +342,9 @@ function Browse({ route, cardHandlers }) {
   const [checking, setChecking] = useState(false);
   const [hidden, setHidden] = useState(0);
   const [error, setError] = useState("");
+  const [personal, setPersonal] = useState(true);
+  const [indexed, setIndexed] = useState(0);
+  const feedKind = useRef("auto");
   const busy = useRef(false);
   const itemsRef = useRef(items);
   itemsRef.current = items;
@@ -353,7 +363,16 @@ function Browse({ route, cardHandlers }) {
       };
       try {
         if (route.view === "saved") apply(await api("/saved", { signal }));
-        else if (route.view === "feed")
+        else if (route.view === "feed" && feedKind.current !== "featured") {
+          const data = await api(`/foryou?page=${cursor || 0}`, { signal });
+          if (data.personal) apply(data);
+          else {
+            // Nothing to personalise yet: show the featured pictures until the user opens or saves some.
+            feedKind.current = "featured";
+            setPersonal(false);
+            apply(await api("/feed", { signal }));
+          }
+        } else if (route.view === "feed" || route.view === "featured")
           apply(await api(`/feed${cursor ? `?cont=${encodeURIComponent(cursor)}` : ""}`, { signal }));
         else {
           const url = `/search?q=${encodeURIComponent(route.q)}&offset=${cursor || 0}`;
@@ -395,6 +414,13 @@ function Browse({ route, cardHandlers }) {
     return () => ctl.abort();
   }, [load]);
 
+  useEffect(() => {
+    if (route.view !== "feed" && route.view !== "featured") return;
+    api("/health")
+      .then((h) => setIndexed(h.indexed))
+      .catch(() => {});
+  }, [route.view]);
+
   // Keep the "Salvata" state in sync when a card is saved from another view.
   useEffect(() => {
     const onSaved = (e) =>
@@ -413,7 +439,35 @@ function Browse({ route, cardHandlers }) {
 
   return (
     <main className="px-4 pb-16 md:px-6">
-      {route.view === "feed" && (
+      {(route.view === "feed" || route.view === "featured") && (
+        <div className="fade-in mb-5 flex flex-col items-center gap-2">
+          <div className="flex gap-1 rounded-full bg-wash p-1">
+            {[
+              ["feed", "Per te"],
+              ["featured", "In evidenza"],
+            ].map(([view, label]) => (
+              <button
+                key={view}
+                type="button"
+                onClick={() => cardHandlers.onNav(view)}
+                className={`rounded-full px-5 py-2 text-sm font-semibold transition ${
+                  route.view === view ? "bg-white text-ink shadow-sm" : "text-mute hover:text-ink"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-mute">
+            {route.view === "feed" && !personal
+              ? "Apri e salva qualche immagine: qui nascerà il tuo feed personale."
+              : indexed
+                ? `${indexed.toLocaleString("it-IT")} immagini nel tuo indice · cresce mentre navighi`
+                : "\u00a0"}
+          </p>
+        </div>
+      )}
+      {(route.view === "feed" || route.view === "featured") && (
         <div className="-mx-4 mb-6 flex gap-2 overflow-x-auto px-4 pb-1 md:mx-0 md:flex-wrap md:justify-center md:px-0">
           {SUGGESTIONS.map((s, i) => (
             <button
@@ -508,7 +562,7 @@ function Detail({ route, preview, cardHandlers, onBack }) {
   const [items, setItems] = useState([]);
   const [weight, setWeight] = useState(0.75);
   const [phase, setPhase] = useState("loading"); // loading | refining | ready | error
-  const [info, setInfo] = useState({ pending: 0, candidates: 0 });
+  const [info, setInfo] = useState({ pending: 0, candidates: 0, more: false });
   const [voting, setVoting] = useState(false);
   const [error, setError] = useState("");
   const [bigLoaded, setBigLoaded] = useState(false);
@@ -516,20 +570,36 @@ function Detail({ route, preview, cardHandlers, onBack }) {
   const run = useRef(0);
   const shown = useRef(false);
 
+  const limit = useRef(SIMILAR_PAGE);
+
   const fetchSimilar = useCallback(
     async (budget, w) => {
-      const qs = new URLSearchParams({ title: route.file, weight: String(w), budget: String(budget) });
+      const qs = new URLSearchParams({
+        title: route.file,
+        weight: String(w),
+        budget: String(budget),
+        limit: String(limit.current),
+      });
       if (route.q) qs.set("q", route.q);
       return api(`/similar?${qs}`);
     },
     [route.file, route.q],
   );
 
-  const show = useCallback((data) => {
+  const show = useCallback((data, append) => {
     const apply = () => {
-      setItems(data.items);
-      setInfo({ pending: data.pending, candidates: data.candidates });
+      // Scrolling down appends: cards already on screen keep their place, like a Pinterest board.
+      setItems((prev) => {
+        if (!append) return data.items;
+        const seen = new Set(prev.map((p) => p.title));
+        return [...prev, ...data.items.filter((i) => !seen.has(i.title))];
+      });
+      setInfo({ pending: data.pending, candidates: data.candidates, more: data.items.length >= limit.current });
     };
+    if (append) {
+      apply();
+      return;
+    }
     // First results rise in; later rounds glide cards to their new rank.
     if (shown.current) withTransition(apply);
     else apply();
@@ -538,14 +608,14 @@ function Detail({ route, preview, cardHandlers, onBack }) {
 
   // Load, then keep refining while there are candidates that have not been looked at yet.
   const refresh = useCallback(
-    async (firstBudget, w) => {
+    async (firstBudget, w, append = false) => {
       const id = ++run.current;
       try {
         let data = await fetchSimilar(firstBudget, w);
         if (id !== run.current) return;
         setOrigin((o) => ({ ...o, ...data.origin }));
-        show(data);
-        for (let round = 0; round < REFINE_ROUNDS && data.pending > 0; round += 1) {
+        show(data, append);
+        for (let round = 0; !append && round < REFINE_ROUNDS && data.pending > 0; round += 1) {
           setPhase("refining");
           data = await fetchSimilar(REFINE_BUDGET, w);
           if (id !== run.current) return;
@@ -609,6 +679,12 @@ function Detail({ route, preview, cardHandlers, onBack }) {
       setVoting(false);
     }
   };
+
+  const loadMore = useCallback(() => {
+    limit.current += SIMILAR_PAGE;
+    setPhase("refining");
+    refresh(REFINE_BUDGET, weight, true);
+  }, [refresh, weight]);
 
   const analysed = info.candidates - info.pending;
   const busy = phase === "loading" || phase === "refining";
@@ -695,7 +771,7 @@ function Detail({ route, preview, cardHandlers, onBack }) {
                   rel="noreferrer"
                   className="flex items-center gap-1.5 rounded-full bg-wash px-5 py-3 text-sm font-semibold transition hover:bg-line"
                 >
-                  Apri su Commons {Icon.out}
+                  Apri su {origin.source || "Wikimedia Commons"} {Icon.out}
                 </a>
               )}
             </div>
@@ -759,19 +835,12 @@ function Detail({ route, preview, cardHandlers, onBack }) {
         phase !== "error" && <p className="py-16 text-center text-mute">Nessuna immagine simile trovata.</p>
       )}
 
-      {phase === "ready" && info.pending > 0 && (
-        <div className="mt-8 text-center">
-          <button
-            type="button"
-            onClick={() => {
-              setPhase("refining");
-              refresh(REFINE_BUDGET, weight);
-            }}
-            className="rounded-full bg-wash px-6 py-3 text-sm font-semibold transition hover:-translate-y-0.5 hover:bg-ink hover:text-white"
-          >
-            Esplora altre {Math.min(info.pending, REFINE_BUDGET)} immagini
-          </button>
-        </div>
+      <InfiniteSentinel onVisible={loadMore} active={phase === "ready" && (info.pending > 0 || info.more)} />
+      {phase === "refining" && items.length > 0 && (
+        <p className="mt-8 flex items-center justify-center gap-2 text-sm text-mute">
+          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-ink" />
+          Cerco altre immagini simili…
+        </p>
       )}
     </main>
   );
@@ -828,6 +897,7 @@ export default function App() {
       });
       if (imgEl) imgEl.style.viewTransitionName = "hero";
       const q = route.view === "search" || route.view === "file" ? route.q : "";
+      api("/view", { body: { title: item.title, item } }).catch(() => {});
       withTransition(() => {
         setPreview(item);
         go({ view: "file", file: item.title, q });
@@ -836,7 +906,7 @@ export default function App() {
     [go, route],
   );
 
-  const cardHandlers = { onOpen, onSave, onSearch: (q) => go({ view: "search", q }) };
+  const cardHandlers = { onOpen, onSave, onSearch: (q) => go({ view: "search", q }), onNav: (view) => go({ view, q: "" }) };
 
   return (
     <div className="min-h-screen">
