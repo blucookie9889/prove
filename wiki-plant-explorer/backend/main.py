@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient, models
 
 from .commons import Commons
-from .sources import Cleveland, INaturalist
+from .sources import Cleveland, INaturalist, Pexels, RateLimited, Unsplash
 from .translator import Translator
 from .embedder import SEMANTIC_DIM, VISUAL_DIM, Embedder
 
@@ -35,6 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "qdrant_db"
 FEEDBACK_PATH = ROOT / "state" / "feedback.json"
 CRAWL_PATH = ROOT / "state" / "crawler.json"
+ENV_PATH = ROOT / ".env"  # API keys (git-ignored); see .env.example
 COLLECTION = "commons_vectors"
 SPACES = ("visual", "semantic")
 
@@ -55,11 +56,26 @@ HOP_SEEDS = 4
 # Search: Commons matches words in titles and descriptions, so "hole" also finds villages called
 # Hole and portraits of people named Buchi. Every result is checked with CLIP against the query
 # (image-text cosine): results far below the best of the page don't show the concept and are hidden.
-SEARCH_PAGE = 36  # Commons results per page...
+SEARCH_PAGE = 24  # Commons results per page from "Quality images" and as many from everything...
 SOURCE_PAGE = 12  # ...plus this many from each other collection
 CLIP_UNDERSTOOD = 0.22  # best image-text cosine below this: CLIP doesn't know the query, don't filter
 CLIP_FLOOR = 0.19
 CLIP_SPREAD = 0.13
+# Beauty: Commons is an archive (diagrams, maps, scans, flat snapshots), Pinterest is curated. CLIP
+# zero-shot: p = softmax(100 * cos) of "beautiful photograph" prompts vs. AESTH_NEG, from the
+# semantic vector alone (no extra download). Calibrated on contact sheets of ~7000 indexed images:
+# p < JUNK is documents, PLAIN..JUNK flat snapshots and product shots, above ~0.02 good photos.
+AESTH_POS = ["a beautiful photograph", "a stunning high quality photo", "an aesthetic professional photograph",
+             "award-winning photography", "a beautiful artwork"]
+AESTH_NEG = ["a diagram", "a chart or graph", "a scanned page of a document with text", "a screenshot", "a map",
+             "a technical drawing", "a blurry low quality photo", "a boring amateur snapshot",
+             "a dull grainy old photo", "a page of a book"]
+JUNK = 0.001
+PLAIN = 0.004
+WANTS_DOCUMENTS = 0.71  # query text this close to an AESTH_NEG prompt ("old map", "manuscript"): no filter
+AESTH_SEARCH = 0.04  # added to the image-text cosine (spread of a page is ~0.1)
+AESTH_SIMILAR = 0.15  # added to the 0..1 similarity score
+MIN_BEAUTIFUL = 12  # plain images are hidden only when at least this many better ones remain
 # Index neighbours: images already in the local vector cache that are closest to the origin. They
 # cost nothing to rank, so the more the app is used (and the crawler runs) the better "similar" gets.
 INDEX_NEIGHBOURS = 160
@@ -89,8 +105,10 @@ S: dict = {}
 async def lifespan(_: FastAPI):
     S["embedder"] = Embedder()
     S["translator"] = Translator()
+    aesthetic(np.zeros((1, SEMANTIC_DIM), dtype=np.float32))  # encode the beauty prompts once
     S["commons"] = Commons()
-    S["sources"] = {src.key: src for src in (Cleveland(S["commons"]._get), INaturalist(S["commons"]._get))}
+    S["sources"] = make_sources(S["commons"])
+    log.info("sources: Wikimedia Commons, %s", ", ".join(src.label for src in S["sources"].values()))
     client = QdrantClient(path=str(DB_PATH))
     if not client.collection_exists(COLLECTION):
         client.create_collection(
@@ -114,6 +132,29 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="wiki-explorer", lifespan=lifespan)
+
+
+def load_env() -> dict:
+    """KEY=value lines from ``.env``, overridden by real environment variables."""
+    env = {}
+    if ENV_PATH.exists():
+        for line in ENV_PATH.read_text().splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and not key.startswith("#"):
+                env[key.strip()] = value.strip().strip("'\"")
+    env.update({k: v for k, v in os.environ.items() if k in ("UNSPLASH_ACCESS_KEY", "PEXELS_API_KEY")})
+    return env
+
+
+def make_sources(commons: Commons) -> dict:
+    """The keyless collections, plus Unsplash / Pexels when their free API key is configured."""
+    env = load_env()
+    sources = [Cleveland(commons._get), INaturalist(commons._get)]
+    if env.get("UNSPLASH_ACCESS_KEY"):
+        sources.append(Unsplash(commons._get, env["UNSPLASH_ACCESS_KEY"]))
+    if env.get("PEXELS_API_KEY"):
+        sources.append(Pexels(commons._get, env["PEXELS_API_KEY"]))
+    return {src.key: src for src in sources}
 
 
 # --------------------------------------------------------------------------- feedback store
@@ -220,9 +261,18 @@ async def resolve(title: str) -> Optional[dict]:
     if title.startswith("File:"):
         found = await S["commons"].files([title])
         return found[0] if found else None
+    # Already in the index: no request (Unsplash/Pexels have small hourly limits).
+    for p in S["qdrant"].retrieve(COLLECTION, ids=[point_id(title)], with_payload=True):
+        if p.payload.get("thumb"):
+            return clean(p.payload)
     key, _, ident = title.partition(":")
     src = S["sources"].get(key)
-    return await src.get(ident) if src else None
+    if not src:
+        return None
+    try:
+        return await src.get(ident)
+    except RateLimited:
+        return None
 
 
 def index_neighbours(vec: dict, limit: int = INDEX_NEIGHBOURS, weight: float = 0.75) -> list[dict]:
@@ -322,7 +372,8 @@ async def crawler() -> None:
             if where == "commons":
                 items, cont = await S["commons"].category_files(what, limit=CRAWL_BATCH, cont=st["cont"].get(key))
             else:
-                items, cont = await S["sources"][where].search(what, offset=st["cont"].get(key) or 0, limit=CRAWL_BATCH)
+                items, cont = await S["sources"][where].search(
+                    what, offset=st["cont"].get(key) or 0, limit=CRAWL_BATCH, background=True)
             if cont:
                 st["cont"][key] = cont
             else:
@@ -332,6 +383,8 @@ async def crawler() -> None:
             save_crawl_state()
         except asyncio.CancelledError:
             raise
+        except RateLimited:
+            continue  # that source's hourly budget is spent; other turns go on
         except Exception as exc:  # noqa: BLE001 - keep crawling whatever one category does
             log.warning("crawler %s: %s", key, exc)
 
@@ -372,23 +425,58 @@ async def to_english(query: str) -> tuple[str, Optional[str]]:
 
 
 async def federated_search(query: str, page: int) -> tuple[list[dict], Optional[int]]:
-    """One page from Commons and from each other collection, interleaved (3 Commons : 1 other)."""
-    jobs = [S["commons"].search(query, offset=page * SEARCH_PAGE, limit=SEARCH_PAGE)]
+    """One page from Commons (curated "Quality images" first, then everything) and from each other
+    collection, interleaved (3 Commons : 1 other)."""
+    jobs = [
+        S["commons"].search(query, offset=page * SEARCH_PAGE, limit=SEARCH_PAGE, curated=True),
+        S["commons"].search(query, offset=page * SEARCH_PAGE, limit=SEARCH_PAGE),
+    ]
     jobs += [src.search(query, offset=page * SOURCE_PAGE, limit=SOURCE_PAGE) for src in S["sources"].values()]
     results = await asyncio.gather(*jobs, return_exceptions=True)
     lists, more = [], False
     for r in results:
         if isinstance(r, Exception):
-            log.warning("search source failed: %s", r)
+            if not isinstance(r, RateLimited):
+                log.warning("search source failed: %s", r)
+            lists.append([])
             continue
         lists.append(r[0])
         more = more or r[1] is not None
-    commons_items, others = (lists[0], lists[1:]) if lists else ([], [])
+    seen: set = set()
+    commons_items = [it for it in lists[0] + lists[1] if not (it["title"] in seen or seen.add(it["title"]))]
+    others = lists[2:]
     out: list[dict] = []
     for i in range(max([len(commons_items) // 3 + 1] + [len(l) for l in others])):
         out += commons_items[i * 3 : i * 3 + 3]
         out += [l[i] for l in others if i < len(l)]
     return out, (page + 1 if more else None)
+
+
+def aesthetic(semantic: np.ndarray) -> np.ndarray:
+    """Probability-like beauty score per row of CLIP image vectors (see AESTH_POS / AESTH_NEG)."""
+    if "aesth" not in S:
+        pos = np.asarray(S["embedder"].embed_text(AESTH_POS), dtype=np.float32)
+        neg = np.stack([np.asarray(S["embedder"].embed_text([t]), dtype=np.float32) for t in AESTH_NEG])
+        S["aesth"] = (pos, neg)
+    pos, neg = S["aesth"]
+    logits = 100 * np.concatenate([(semantic @ pos)[:, None], semantic @ neg.T], axis=1)
+    logits -= logits.max(axis=1, keepdims=True)
+    p = np.exp(logits)
+    return p[:, 0] / p.sum(axis=1)
+
+
+def beauty(p: np.ndarray) -> np.ndarray:
+    """``aesthetic`` on a 0..1 log scale (1e-3 -> 0, 1 -> 1)."""
+    return np.clip((np.log10(p + 1e-9) + 3) / 3, 0, 1)
+
+
+def wants_documents(query: str) -> bool:
+    """True for queries about maps, diagrams, manuscripts... where the beauty filter would hide everything."""
+    cache = S.setdefault("wants_documents", {})
+    if query not in cache:
+        q = np.asarray(S["embedder"].embed_text([f"a photo of a {query}."]), dtype=np.float32)
+        cache[query] = float(np.max(S["aesth"][1] @ q)) > WANTS_DOCUMENTS
+    return cache[query]
 
 
 def text_vector(text: str) -> np.ndarray:
@@ -422,13 +510,22 @@ async def search(
 
     hidden = 0
     if checked:
-        sims = np.stack([vecs[it["title"]]["semantic"] for it in checked]) @ text_vector(english)
+        semantic = np.stack([vecs[it["title"]]["semantic"] for it in checked])
+        sims = semantic @ text_vector(english)
         best = float(sims.max())
         cutoff = max(CLIP_FLOOR, best - CLIP_SPREAD) if best >= CLIP_UNDERSTOOD else -1.0
+        # Beauty: documents are hidden, the rest is ranked partly by how good the picture is,
+        # and flat snapshots go too when there are enough better pictures.
+        quality = aesthetic(semantic)
+        documents = wants_documents(english)
+        floor = 0.0 if documents else JUNK
+        if not documents and int(np.sum((sims >= cutoff) & (quality >= PLAIN))) >= MIN_BEAUTIFUL:
+            floor = PLAIN
+        rank = sims + (0.0 if documents else AESTH_SEARCH) * beauty(quality)
         kept: list[int] = []
-        for i in np.argsort(-sims):
-            if sims[i] < cutoff:
-                break
+        for i in np.argsort(-rank):
+            if sims[i] < cutoff or quality[i] < floor:
+                continue
             v = vecs[checked[i]["title"]]["visual"]
             if kept and max(float(vecs[checked[k]["title"]]["visual"] @ v) for k in kept) > NEAR_DUP:
                 continue
@@ -492,7 +589,8 @@ async def candidates_for(origin: dict, query: Optional[str], extra_origins: list
         return [r[0] for r in res if not isinstance(r, Exception)]
 
     async def from_sources(text: str, per_source: int) -> list[list[dict]]:
-        res = await asyncio.gather(*(src.search(text, limit=per_source) for src in S["sources"].values()), return_exceptions=True)
+        res = await asyncio.gather(*(src.search(text, limit=per_source, background=True) for src in S["sources"].values()),
+                                   return_exceptions=True)
         return [r[0] for r in res if not isinstance(r, Exception)]
 
     jobs = []
@@ -504,7 +602,7 @@ async def candidates_for(origin: dict, query: Optional[str], extra_origins: list
     else:
         src = S["sources"][title.partition(":")[0]]
         related = src.related_query(origin)
-        jobs += [src.search(related, limit=40), commons.search(related, limit=30)]
+        jobs += [src.search(related, limit=40, background=True), commons.search(related, limit=30)]
     if query:
         english, _ = await to_english(query)
         jobs += [commons.search(english, limit=40), from_sources(english, 12)]
@@ -514,7 +612,8 @@ async def candidates_for(origin: dict, query: Optional[str], extra_origins: list
     lists: list[list[dict]] = []
     for r in results:
         if isinstance(r, Exception):
-            log.warning("candidate source failed: %s", r)
+            if not isinstance(r, RateLimited):
+                log.warning("candidate source failed: %s", r)
         elif isinstance(r, tuple):  # commons.search -> (items, next)
             lists.append(r[0])
         else:
@@ -604,12 +703,22 @@ async def _similar(title: str, weight: float, q: Optional[str], limit: int, budg
             score = score + TASTE * minmax(matrix @ taste)
         final += w * score
 
+    # Beauty, unless the origin itself is a document / plain picture (then that's what the user wants).
+    semantic = np.stack([vecs[c["title"]]["semantic"] for c in ranked])
+    quality = aesthetic(semantic)
+    origin_quality = float(aesthetic(vecs[title]["semantic"][None, :])[0])
+    if origin_quality >= PLAIN:
+        final += AESTH_SIMILAR * beauty(quality)
+        final[quality < JUNK] = -np.inf
+
     # Greedy pick in score order, skipping near-duplicates (crops, re-uploads, burst shots) of the
     # origin or of an image already picked, so the top of the list is similar but not repetitive.
     visual = np.stack([vecs[c["title"]]["visual"] for c in ranked])
     origin_v = vecs[title]["visual"]
     picked: list[int] = []
     for i in np.argsort(-final):
+        if not np.isfinite(final[i]):
+            break
         if float(visual[i] @ origin_v) > NEAR_DUP:
             continue
         if picked and float(np.max(visual[picked] @ visual[i])) > NEAR_DUP:
@@ -673,13 +782,16 @@ def build_for_you(seeds: list[str]) -> list[dict]:
                     order.append(l[pos[i]])
                     pos[i] += 1
     # Drop near-duplicates (burst shots, crops) so the feed doesn't repeat itself.
-    out_vecs = {p.payload["title"]: np.asarray(p.vector["visual"], dtype=np.float32) for p in client.retrieve(
-        COLLECTION, ids=[point_id(it["title"]) for it in order], with_vectors=["visual"], with_payload=["title"])}
+    # ...and pictures that aren't nice (documents, flat snapshots): a home feed should be beautiful.
+    out = client.retrieve(COLLECTION, ids=[point_id(it["title"]) for it in order], with_vectors=True, with_payload=["title"])
+    out_vecs = {p.payload["title"]: np.asarray(p.vector["visual"], dtype=np.float32) for p in out}
+    quality = dict(zip((p.payload["title"] for p in out),
+                       aesthetic(np.stack([np.asarray(p.vector["semantic"], dtype=np.float32) for p in out])) if out else []))
     kept: list[dict] = []
     kept_v: list[np.ndarray] = []
     for it in order:
         v = out_vecs.get(it["title"])
-        if v is None:
+        if v is None or quality[it["title"]] < PLAIN:
             continue
         if kept_v and float(np.max(np.stack(kept_v[-200:]) @ v)) > NEAR_DUP:
             continue

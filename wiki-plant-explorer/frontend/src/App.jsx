@@ -496,7 +496,7 @@ function Browse({ route, cardHandlers }) {
                 Controllo che ogni immagine mostri davvero “{english || route.q}”…
               </span>
             ) : hidden ? (
-              `${hidden} immagini nascoste perché non mostrano “${english || route.q}”`
+              `${hidden} immagini nascoste: fuori tema o poco belle`
             ) : null}
           </p>
         </div>

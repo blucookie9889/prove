@@ -6,3 +6,4 @@ venv/
 frontend/node_modules/
 frontend/dist/
 state/
+.env

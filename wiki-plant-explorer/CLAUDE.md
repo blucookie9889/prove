@@ -1,7 +1,8 @@
 # wiki-plant-explorer (Wiki Explorer)
 
 A personal, Pinterest-style explorer over **all of Wikimedia Commons** plus other open collections
-(Cleveland Museum of Art CC0 artworks, iNaturalist CC0/CC BY/CC BY-SA nature photos), browsed live
+(Cleveland Museum of Art CC0 artworks, iNaturalist CC0/CC BY/CC BY-SA nature photos, and Unsplash /
+Pexels photography when their free API keys are in `.env`), browsed live
 through their public APIs. Click an image to get visually similar ones; "più così / meno così" feedback
 refines the ranking, opened and saved images feed a personal "Per te" home, and a background crawler
 keeps growing a local vector index. No image is ever stored on disk: only vectors.
@@ -10,7 +11,10 @@ keeps growing a local vector index. No image is ever stored on disk: only vector
 
 ```
 backend/commons.py   async client for Commons/Wikidata APIs (search, feed, categories, depicts, thumbs in memory)
-backend/sources.py   other collections (Cleveland, iNaturalist): search, get by id, items in the Commons shape
+backend/sources.py   other collections (Cleveland, iNaturalist, Unsplash, Pexels): search, get by id, items in
+                     the Commons shape; `Budget` caps requests per hour for the keyed APIs
+backend/translator.py  local MarianMT Italian -> English
+.env                 UNSPLASH_ACCESS_KEY / PEXELS_API_KEY (git-ignored; template in .env.example)
 backend/embedder.py  DINOv2 (visual, 768-d) + OpenCLIP ViT-B-32 (semantic, 512-d), batched, L2-normalised
 backend/main.py      FastAPI: /api/foryou, /api/feed, /api/search, /api/file, /api/similar, /api/vote,
                      /api/view, /api/saved, /api/health; background crawler
@@ -21,8 +25,14 @@ state/crawler.json   crawler cursors, done categories, interest categories and q
 ```
 
 - UI language is Italian. Routes are URL params: `?q=`, `?file=<title>&q=`, `?view=saved`, `?view=featured`.
-- Item titles: Commons keeps `File:...`; other collections use `cma:<id>`, `inat:<observation id>`.
-  `resolve(title)` looks any of them up again; every item carries `source`.
+- Item titles: Commons keeps `File:...`; other collections use `cma:<id>`, `inat:<observation id>`,
+  `unsplash:<id>`, `pexels:<id>`. `resolve(title)` looks any of them up again (index payload first,
+  so keyed APIs aren't charged); every item carries `source`.
+- Keyed sources (Unsplash demo apps: 50 requests/hour; Pexels: 200/hour) are registered only when
+  their key is set. Each has a `Budget`: background work (crawler, candidate lookups for similar,
+  `background=True`) may use 40% of it, so user searches keep working; an exhausted budget raises
+  `RateLimited`, which callers skip silently. Responses are cached 15 min, so the CLIP-check
+  re-request of a search page costs nothing. Unsplash links carry the referral UTM params it requires.
 - Home "Per te" (`/api/foryou`): seeds = saved / "più così" images (counted as 3 days newer) and
   opened images, most recent first (max 30). For each seed, its nearest neighbours in the local index;
   weighted round-robin (newest seeds 3 per round, then 2, then 1), near-duplicates removed. Without
@@ -36,14 +46,28 @@ state/crawler.json   crawler cursors, done categories, interest categories and q
      - Otherwise the local MarianMT model (`backend/translator.py`, Helsinki-NLP/opus-mt-it-en,
        ~0.1 s) translates the whole phrase ("fori nel metallo" -> "holes in metal").
      - Single words skip Wikidata, whose most famous sense is often wrong ("fori" -> forum).
-  2. Federated: Commons `generator=search` with `filetype:bitmap` (36 per page) + 12 from each other
-     collection, interleaved 3:1. `offset` is a page index.
+  2. Federated: Commons `generator=search` with `filetype:bitmap`, 24 per page restricted to
+     `incategory:Quality_images` (community-reviewed) first, then 24 unrestricted; + 12 from each
+     other collection, interleaved 3:1. `offset` is a page index.
   3. Every result is checked with CLIP: image vs. the text embedding of the English query (prompt
      ensemble). Results below `max(0.19, best - 0.13)` are hidden, unless CLIP doesn't understand the
-     query (best < 0.22). The rest are sorted by score, with near-duplicates removed.
+     query (best < 0.22). The rest are sorted by score + beauty (see below), with near-duplicates removed.
   4. The frontend loads the first page with `budget=0`, which is instant: it uses cached vectors and
      leaves the other results unchecked. It then calls `budget=72` and swaps the cleaned page in with a
      View Transition.
+
+## Beauty
+
+Commons is an archive (diagrams, maps, scans, flat snapshots); Pinterest is curated. `aesthetic()`
+is a CLIP zero-shot score computed from the stored semantic vector alone: softmax(100·cos) of
+"beautiful photograph" prompts against document / low-quality prompts (`AESTH_POS`, `AESTH_NEG`).
+Calibrated on contact sheets of ~7000 indexed images: < 0.001 = documents (`JUNK`), up to 0.004 =
+flat snapshots and product shots (`PLAIN`), above ~0.02 = good photos.
+- Search: `JUNK` always hidden; `PLAIN` hidden too when ≥ 12 better relevant images remain; rank =
+  relevance + 0.04·beauty. Skipped when the query is itself about documents (`wants_documents`:
+  query text within 0.71 cosine of a negative prompt, e.g. "ancient map", "manuscript").
+- Similar: + 0.15·beauty and `JUNK` hidden, unless the origin itself is below `PLAIN`.
+- Per te: images below `PLAIN` are dropped.
 
 ## Similar images (`/api/similar`)
 

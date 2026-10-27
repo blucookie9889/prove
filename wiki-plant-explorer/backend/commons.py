@@ -84,8 +84,13 @@ class Commons:
     async def close(self) -> None:
         await self.http.aclose()
 
-    async def _get(self, url: str, **params) -> dict:
-        """Cached GET of a JSON API (MediaWiki ones get format=json; also used by ``sources``)."""
+    async def _get(self, url: str, _headers: Optional[dict] = None, _budget=None, _background: bool = False,
+                   **params) -> dict:
+        """Cached GET of a JSON API (MediaWiki ones get format=json; also used by ``sources``).
+
+        ``_budget`` (a ``sources.Budget``) is only charged on a cache miss; it raises
+        ``sources.RateLimited`` instead of sending a request the API would refuse.
+        """
         if url.endswith("api.php"):
             params.setdefault("format", "json")
             params.setdefault("formatversion", 2)
@@ -93,10 +98,12 @@ class Commons:
         hit = self._cache.get(key)
         if hit and time.time() - hit[0] < CACHE_TTL_S:
             return hit[1]
-        resp = await self.http.get(url, params=params)
+        if _budget is not None:
+            _budget.take(_background)
+        resp = await self.http.get(url, params=params, headers=_headers)
         if resp.status_code == 429:  # back off once, politely
             await asyncio.sleep(min(float(resp.headers.get("retry-after") or 2), 5))
-            resp = await self.http.get(url, params=params)
+            resp = await self.http.get(url, params=params, headers=_headers)
         resp.raise_for_status()
         data = resp.json()
         if len(self._cache) > 5000:
@@ -198,10 +205,13 @@ class Commons:
         best = max(hits.values(), key=lambda h: h["weight"])
         return best["label"], best["id"]
 
-    async def search(self, query: str, offset: int = 0, limit: int = 40) -> tuple[list[dict], Optional[int]]:
+    async def search(self, query: str, offset: int = 0, limit: int = 40,
+                     curated: bool = False) -> tuple[list[dict], Optional[int]]:
+        """Full-text file search. ``curated`` keeps only community-reviewed "Quality images"."""
+        extra = " incategory:Quality_images" if curated else ""
         data = await self._get(
             COMMONS_API, action="query", generator="search", gsrnamespace=6,
-            gsrsearch=f"{query} filetype:bitmap", gsrlimit=limit, gsroffset=offset, **self._IMAGEINFO,
+            gsrsearch=f"{query} filetype:bitmap{extra}", gsrlimit=limit, gsroffset=offset, **self._IMAGEINFO,
         )
         nxt = (data.get("continue") or {}).get("gsroffset")
         return self._items(data), nxt
