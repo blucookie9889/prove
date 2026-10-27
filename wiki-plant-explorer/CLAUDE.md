@@ -28,15 +28,14 @@ state/crawler.json   crawler cursors, done categories, interest categories and q
   weighted round-robin (newest seeds 3 per round, then 2, then 1), near-duplicates removed. Without
   any seed it falls back to "In evidenza" = newest `Category:Featured pictures on Wikimedia Commons`.
 - Search (`/api/search`):
-  1. `Commons.translate` maps the query to the English label of a Wikidata item, because Commons
-     titles are mostly English and Italian words hit surnames and places ("buchi" = a surname).
-     - Only exact Italian label/alias matches count, and the words are also tried in the singular
-       (`_singulars`: "buchi" -> "buco" -> "hole", "occhi" -> "occhio" -> "eye").
-     - A capitalised match for a lower-case query is a proper noun and is used only as a last resort.
-     - Names and works are dropped by their description (`_PROPER`).
-     - The remaining matches are ranked by Wikipedia sitelinks, then labels over aliases, then the
-       form as typed.
-     - Phrases with no item are translated word by word ("foglie rosse" -> "leaf red").
+  1. `to_english` translates the query, because Commons titles and CLIP are English and Italian
+     words hit surnames and places ("buchi" is a surname, "Nel" a person):
+     - Multi-word queries first try `Commons.concept`: an exact Italian label/alias of a Wikidata
+       item (also in the singular), for fixed terms like "scale a chiocciola" -> "helical stairs".
+       It ignores proper nouns, names and works (`_PROPER`), and ranks matches by sitelinks.
+     - Otherwise the local MarianMT model (`backend/translator.py`, Helsinki-NLP/opus-mt-it-en,
+       ~0.1 s) translates the whole phrase ("fori nel metallo" -> "holes in metal").
+     - Single words skip Wikidata, whose most famous sense is often wrong ("fori" -> forum).
   2. Federated: Commons `generator=search` with `filetype:bitmap` (36 per page) + 12 from each other
      collection, interleaved 3:1. `offset` is a page index.
   3. Every result is checked with CLIP: image vs. the text embedding of the English query (prompt
@@ -89,7 +88,7 @@ re-rank glides via per-card names) and falls back to plain updates where unsuppo
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
-uvicorn backend.main:app --host 127.0.0.1 --port 8001   # loads models (~5 s; downloads them on first run)
+uvicorn backend.main:app --host 127.0.0.1 --port 8001   # loads DINOv2, CLIP, MarianMT (downloads them on first run)
 
 cd frontend && npm install && API_TARGET=http://127.0.0.1:8001 npm run dev   # http://localhost:5173
 ```

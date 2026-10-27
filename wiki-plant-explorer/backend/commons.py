@@ -155,20 +155,17 @@ class Commons:
 
     # ----------------------------------------------------------------- search & feed
 
-    async def translate(self, query: str) -> tuple[str, Optional[str]]:
-        """Map an Italian (or any) query to the English label and id of the matching Wikidata concept.
+    async def concept(self, query: str) -> tuple[Optional[str], Optional[str]]:
+        """English label and id of the Wikidata concept whose Italian name is exactly ``query``.
 
-        Commons file titles are mostly English, so "foglia" alone finds surnames and villages;
-        Wikidata knows it means Q33971 "leaf". Only exact matches of an Italian label/alias count.
-        The words are tried as typed and in the singular ("buchi" -> "buco" -> "hole"). A capitalised
-        match for a lower-case query is a proper noun ("Buchi", a surname) and only counts if nothing
-        else matches. Names and works are dropped by their description; the rest are ranked by
-        number of Wikipedia articles, preferring labels over aliases and the form as typed.
-        Returns (query, None) when nothing fits.
+        Used for fixed terms a word-by-word translator gets wrong ("scale a chiocciola" is
+        "helical stairs", not "snail stairs"). The words are also tried in the singular. Proper nouns
+        (a capitalised match for a lower-case query), names and works are ignored; among the rest
+        the concept with most Wikipedia articles wins, preferring labels over aliases and the form
+        as typed. Returns (None, None) when nothing fits.
         """
         q = query.strip()
-        common: dict[str, dict] = {}
-        proper: dict[str, dict] = {}
+        hits: dict[str, dict] = {}
         for rank, form in enumerate(_singulars(q.lower())):
             try:
                 data = await self._get(
@@ -185,25 +182,20 @@ class Commons:
                     continue
                 if text.lower() != form or not hit.get("label") or _PROPER.search(hit.get("description") or ""):
                     continue
-                # Labels beat aliases ("rossa" is an alias of a pizza), the form as typed beats guesses.
+                if q == q.lower() and text != text.lower():
+                    continue
                 weight = (1.0 if match["type"] == "label" else 0.3) * 0.6 ** rank
-                bucket = proper if q == q.lower() and text != text.lower() else common
-                bucket.setdefault(hit["id"], {**hit, "weight": weight})
-        hits = list((common or proper).values())
+                hits.setdefault(hit["id"], {**hit, "weight": weight})
         if not hits:
-            if " " in q:  # no concept for the whole phrase: translate word by word ("foglie rosse")
-                words = [await self.translate(w) for w in q.split()]
-                return " ".join(w for w, _ in words), next((qid for _, qid in words if qid), None)
-            return query, None
+            return None, None
         if len(hits) > 1:
             try:
-                ids = "|".join(h["id"] for h in hits[:50])
-                ent = await self._get(WIKIDATA_API, action="wbgetentities", ids=ids, props="sitelinks")
-                for h in hits:
-                    h["weight"] *= 1 + len(((ent.get("entities") or {}).get(h["id"]) or {}).get("sitelinks") or {})
+                ent = await self._get(WIKIDATA_API, action="wbgetentities", ids="|".join(list(hits)[:50]), props="sitelinks")
+                for qid, h in hits.items():
+                    h["weight"] *= 1 + len(((ent.get("entities") or {}).get(qid) or {}).get("sitelinks") or {})
             except httpx.HTTPError:
                 pass
-        best = max(hits, key=lambda h: h["weight"])
+        best = max(hits.values(), key=lambda h: h["weight"])
         return best["label"], best["id"]
 
     async def search(self, query: str, offset: int = 0, limit: int = 40) -> tuple[list[dict], Optional[int]]:

@@ -28,6 +28,7 @@ from qdrant_client import QdrantClient, models
 
 from .commons import Commons
 from .sources import Cleveland, INaturalist
+from .translator import Translator
 from .embedder import SEMANTIC_DIM, VISUAL_DIM, Embedder
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -87,6 +88,7 @@ S: dict = {}
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     S["embedder"] = Embedder()
+    S["translator"] = Translator()
     S["commons"] = Commons()
     S["sources"] = {src.key: src for src in (Cleveland(S["commons"]._get), INaturalist(S["commons"]._get))}
     client = QdrantClient(path=str(DB_PATH))
@@ -353,6 +355,22 @@ async def feed(cont: Optional[str] = None):
     return {"items": with_saved_flag(items), "next": nxt}
 
 
+async def to_english(query: str) -> tuple[str, Optional[str]]:
+    """English query for Commons and CLIP (plus the Wikidata id when it is a known concept).
+
+    A phrase that is exactly the Italian name of a Wikidata concept uses its English label (fixed
+    terms: "scale a chiocciola" -> "helical stairs"); everything else goes through the local
+    translator, which handles whole phrases and plurals ("fori nel metallo" -> "holes in metal").
+    Single words skip Wikidata: there a word's most famous meaning often isn't the one meant
+    ("fori" -> the Roman forum instead of holes).
+    """
+    if " " in query.strip():
+        label, qid = await S["commons"].concept(query)
+        if label:
+            return label, qid
+    return await asyncio.to_thread(S["translator"].translate, query), None
+
+
 async def federated_search(query: str, page: int) -> tuple[list[dict], Optional[int]]:
     """One page from Commons and from each other collection, interleaved (3 Commons : 1 other)."""
     jobs = [S["commons"].search(query, offset=page * SEARCH_PAGE, limit=SEARCH_PAGE)]
@@ -394,7 +412,7 @@ async def search(
     already-known images are checked, the others come back unchecked (``pending``) at the end.
     """
     commons: Commons = S["commons"]
-    english, qid = await commons.translate(q)
+    english, qid = await to_english(q)
     if offset == 0:
         note_query(english)
     items, nxt = await federated_search(english, offset)
@@ -488,7 +506,7 @@ async def candidates_for(origin: dict, query: Optional[str], extra_origins: list
         related = src.related_query(origin)
         jobs += [src.search(related, limit=40), commons.search(related, limit=30)]
     if query:
-        english, _ = await commons.translate(query)
+        english, _ = await to_english(query)
         jobs += [commons.search(english, limit=40), from_sources(english, 12)]
     jobs += [from_categories(t, 2, 25) for t in extra_origins[:5] if t.startswith("File:")]
     results = await asyncio.gather(*jobs, return_exceptions=True)
