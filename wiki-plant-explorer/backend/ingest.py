@@ -37,7 +37,8 @@ COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 # A transitive walk of the whole plant tree (wdt:P171+ wd:Q756) times out on the public
 # endpoint, so we anchor on a diverse set of plant families (all descendants of Plantae, Q756)
 # and take an even share of species from each. Families are matched by scientific name (P225),
-# which is indexed and fast.
+# which is indexed and fast. Don't add a `wdt:P171+ wd:Q756` check to the query: even anchored
+# on one family it times out (504). Each name below matches exactly one family-rank item.
 FAMILIES = [
     "Rosaceae", "Orchidaceae", "Asteraceae", "Fabaceae", "Lamiaceae",
     "Cactaceae", "Ranunculaceae", "Solanaceae", "Pinaceae", "Liliaceae",
@@ -47,7 +48,7 @@ PER_FAMILY = -(-TARGET_SPECIES // len(FAMILIES))  # ceil division
 
 SPARQL_TEMPLATE = """
 SELECT ?item ?itemLabel ?taxon ?image ?familyLabel WHERE {{
-  ?family wdt:P225 "{family}" ; wdt:P105 wd:Q35409 ; wdt:P171+ wd:Q756 .
+  ?family wdt:P225 "{family}" ; wdt:P105 wd:Q35409 .
   ?genus wdt:P171 ?family .
   ?item wdt:P171 ?genus ;
         wdt:P105 wd:Q7432 ;
@@ -218,6 +219,8 @@ async def main() -> None:
     ) as http:
         items = await fetch_species(http)
         log.info("Fetched %d species from Wikidata", len(items))
+        if not items:
+            raise SystemExit("No species fetched from Wikidata; see the warnings above.")
         await resolve_thumbnails(http, items)
         items = [it for it in items if it.get("image_url")]
         log.info("%d species have a resolvable thumbnail", len(items))

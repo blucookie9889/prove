@@ -35,6 +35,7 @@ qdrant_db/         Embedded Qdrant storage (git-ignored, created by ingest.py)
   pattern both fail on the public endpoint: the first times out, the second matches almost nothing
   because species are `instance of taxon`, not subclasses of Plantae. `ingest.py` instead anchors on
   a list of 15 plant families (verified to descend from Q756) and takes an equal share per family.
+  The per-family query must not include `wdt:P171+ wd:Q756` either: it 504s even when anchored on one family.
   Edit `FAMILIES` to change the mix.
 - Thumbnails come from the Commons `imageinfo` API with `iiurlwidth=500`.
 - Wikimedia requires a descriptive User-Agent (`WikiPlantExplorer/1.0 (...)`). Some cloud/CI egress
@@ -59,4 +60,6 @@ cd frontend && npm install && npm run dev               # http://localhost:5173
 - `ingest.py` drops and recreates the collection on every run.
 - `qdrant-client>=1.12` is required for `query_points` (the old `search` API was removed).
 - The frontend has no API base URL setting; it relies on the Vite dev proxy (`vite.config.js`).
+  If port 8000 is taken (ComfyUI uses it, for example), run uvicorn on another port and start Vite with
+  `API_TARGET=http://127.0.0.1:8001 npm run dev`.
   For a production build, serve `frontend/dist` behind the same origin as the API.
