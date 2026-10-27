@@ -47,6 +47,13 @@ MAX_CANDIDATES = 400
 NEAR_DUP = 0.94
 # How many top visual matches seed the next round's candidate search (second hop).
 HOP_SEEDS = 4
+# Search: Commons matches words in titles and descriptions, so "hole" also finds villages called
+# Hole and portraits of people named Buchi. Every result is checked with CLIP against the query
+# (image-text cosine): results far below the best of the page don't show the concept and are hidden.
+SEARCH_PAGE = 48
+CLIP_UNDERSTOOD = 0.22  # best image-text cosine below this: CLIP doesn't know the query, don't filter
+CLIP_FLOOR = 0.19
+CLIP_SPREAD = 0.13
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -185,12 +192,54 @@ async def feed(cont: Optional[str] = None):
     return {"items": with_saved_flag(items), "next": nxt}
 
 
+def text_vector(text: str) -> np.ndarray:
+    cache = S.setdefault("text_vectors", {})
+    if text not in cache:
+        prompts = [f"a photo of a {text}.", f"a close-up photo of a {text}.", text]
+        cache[text] = np.asarray(S["embedder"].embed_text(prompts), dtype=np.float32)
+    return cache[text]
+
+
 @app.get("/api/search")
-async def search(q: str = Query(..., min_length=1), offset: int = Query(0, ge=0)):
+async def search(
+    q: str = Query(..., min_length=1),
+    offset: int = Query(0, ge=0),
+    budget: int = Query(SEARCH_PAGE, ge=0, le=64),
+):
+    """One page of Commons results, checked by CLIP and sorted by how well they show the query.
+
+    ``budget`` = how many not-yet-seen images may be embedded now. With 0 the answer is instant:
+    already-known images are checked, the others come back unchecked (``pending``) at the end.
+    """
     commons: Commons = S["commons"]
-    english = await commons.translate(q)
-    items, nxt = await commons.search(english, offset=offset)
-    return {"query": q, "english": english, "items": with_saved_flag(items), "next": nxt}
+    english, qid = await commons.translate(q)
+    items, nxt = await commons.search(english, offset=offset, limit=SEARCH_PAGE)
+    vecs, pending = await ensure_vectors(items, new_budget=budget)
+    checked = [it for it in items if it["title"] in vecs]
+    unchecked = [it for it in items if it["title"] not in vecs]
+
+    hidden = 0
+    if checked:
+        sims = np.stack([vecs[it["title"]]["semantic"] for it in checked]) @ text_vector(english)
+        best = float(sims.max())
+        cutoff = max(CLIP_FLOOR, best - CLIP_SPREAD) if best >= CLIP_UNDERSTOOD else -1.0
+        kept: list[int] = []
+        for i in np.argsort(-sims):
+            if sims[i] < cutoff:
+                break
+            v = vecs[checked[i]["title"]]["visual"]
+            if kept and max(float(vecs[checked[k]["title"]]["visual"] @ v) for k in kept) > NEAR_DUP:
+                continue
+            kept.append(int(i))
+        hidden = len(checked) - len(kept)
+        for i in kept:
+            checked[i] = {**checked[i], "relevance": round(float(sims[i]), 3)}
+        checked = [checked[i] for i in kept]
+    log.info("search %r -> %r (%s): %d shown, %d hidden, %d unchecked", q, english, qid, len(checked), hidden, len(unchecked))
+    return {
+        "query": q, "english": english, "qid": qid, "items": with_saved_flag(checked + unchecked),
+        "next": nxt, "pending": pending, "hidden": hidden,
+    }
 
 
 @app.get("/api/saved")
@@ -238,7 +287,8 @@ async def candidates_for(title: str, query: Optional[str], extra_origins: list[s
 
     jobs = [from_categories(title, 4, 40), from_depicts(title)]
     if query:
-        jobs.append(commons.search(query, limit=40))
+        english, _ = await commons.translate(query)
+        jobs.append(commons.search(english, limit=40))
     jobs += [from_categories(t, 2, 25) for t in extra_origins[:5]]
     results = await asyncio.gather(*jobs, return_exceptions=True)
 

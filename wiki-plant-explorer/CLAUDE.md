@@ -17,9 +17,23 @@ state/feedback.json  votes and saved images (git-ignored)
 
 - UI language is Italian. Routes are URL params: `?q=`, `?file=File:...&q=`, `?view=saved`.
 - Home feed = newest members of `Category:Featured pictures on Wikimedia Commons`.
-- Search: the query is mapped to the English label of the matching Wikidata item (exact label/alias
-  match only; "foglia" -> "leaf"), because Commons titles are mostly English and Italian words hit
-  surnames and places. Then `generator=search` with `filetype:bitmap`.
+- Search (`/api/search`):
+  1. `Commons.translate` maps the query to the English label of a Wikidata item, because Commons
+     titles are mostly English and Italian words hit surnames and places ("buchi" = a surname).
+     - Only exact Italian label/alias matches count, and the words are also tried in the singular
+       (`_singulars`: "buchi" -> "buco" -> "hole", "occhi" -> "occhio" -> "eye").
+     - A capitalised match for a lower-case query is a proper noun and is used only as a last resort.
+     - Names and works are dropped by their description (`_PROPER`).
+     - The remaining matches are ranked by Wikipedia sitelinks, then labels over aliases, then the
+       form as typed.
+     - Phrases with no item are translated word by word ("foglie rosse" -> "leaf red").
+  2. `generator=search` with `filetype:bitmap`, 48 per page.
+  3. Every result is checked with CLIP: image vs. the text embedding of the English query (prompt
+     ensemble). Results below `max(0.19, best - 0.13)` are hidden, unless CLIP doesn't understand the
+     query (best < 0.22). The rest are sorted by score, with near-duplicates removed.
+  4. The frontend loads the first page with `budget=0`, which is instant: it uses cached vectors and
+     leaves the other results unchecked. It then calls `budget=48` and swaps the cleaned page in with a
+     View Transition.
 
 ## Similar images (`/api/similar`)
 

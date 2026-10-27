@@ -7,6 +7,8 @@ const SUGGESTIONS = ["foglie", "texture", "architettura gotica", "minerali", "co
 const FIRST_BUDGET = 24;
 const REFINE_BUDGET = 64;
 const REFINE_ROUNDS = 3;
+// Search pages are shown at once, then checked with CLIP (up to this many new images per page).
+const SEARCH_BUDGET = 48;
 // Cards that get their own view-transition name, so they glide to their new place on re-rank.
 const ANIMATED_CARDS = 40;
 const TRAIL_KEY = "wiki-explorer-trail";
@@ -330,30 +332,55 @@ function Browse({ route, cardHandlers }) {
   const [next, setNext] = useState(null);
   const [english, setEnglish] = useState("");
   const [loading, setLoading] = useState(true);
+  const [checking, setChecking] = useState(false);
+  const [hidden, setHidden] = useState(0);
   const [error, setError] = useState("");
   const busy = useRef(false);
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
 
   const load = useCallback(
     async (cursor, signal) => {
       busy.current = true;
-      try {
-        let data;
-        if (route.view === "saved") data = await api("/saved", { signal });
-        else if (route.view === "search")
-          data = await api(`/search?q=${encodeURIComponent(route.q)}&offset=${cursor || 0}`, { signal });
-        else data = await api(`/feed${cursor ? `?cont=${encodeURIComponent(cursor)}` : ""}`, { signal });
-        setItems((prev) => {
-          const seen = new Set(cursor ? prev.map((p) => p.title) : []);
-          return [...(cursor ? prev : []), ...data.items.filter((i) => !seen.has(i.title))];
-        });
+      // Earlier pages stay; the page starting at ``cursor`` is appended (or replaced when checked).
+      const base = cursor ? itemsRef.current : [];
+      const apply = (data) => {
+        const seen = new Set(base.map((p) => p.title));
+        setItems([...base, ...data.items.filter((i) => !seen.has(i.title))]);
         setNext(data.next ?? null);
         setEnglish(data.english || "");
         setError("");
+      };
+      try {
+        if (route.view === "saved") apply(await api("/saved", { signal }));
+        else if (route.view === "feed")
+          apply(await api(`/feed${cursor ? `?cont=${encodeURIComponent(cursor)}` : ""}`, { signal }));
+        else {
+          const url = `/search?q=${encodeURIComponent(route.q)}&offset=${cursor || 0}`;
+          if (!cursor) {
+            // First page: show what Commons found right away, then let CLIP clean it up.
+            const quick = await api(`${url}&budget=0`, { signal });
+            apply(quick);
+            setHidden(quick.hidden || 0);
+            setLoading(false);
+            if (!quick.pending) return;
+            setChecking(true);
+          }
+          const full = await api(`${url}&budget=${SEARCH_BUDGET}`, { signal });
+          withTransition(() => {
+            apply(full);
+            setHidden((h) => (cursor ? h : 0) + (full.hidden || 0));
+          });
+        }
       } catch (e) {
         if (e.name !== "AbortError") setError("Wikimedia non risponde, riprova tra poco.");
       } finally {
         busy.current = false;
-        setLoading(false);
+        if (!signal?.aborted) {
+          // An aborted load (route changed, StrictMode re-run) must not end the next one's spinner.
+          setLoading(false);
+          setChecking(false);
+        }
       }
     },
     [route],
@@ -363,6 +390,7 @@ function Browse({ route, cardHandlers }) {
     const ctl = new AbortController();
     setLoading(true);
     setItems([]);
+    setHidden(0);
     load(null, ctl.signal);
     return () => ctl.abort();
   }, [load]);
@@ -401,12 +429,25 @@ function Browse({ route, cardHandlers }) {
         </div>
       )}
       {route.view === "search" && !loading && (
-        <p className="fade-in mb-6 text-center text-sm text-mute">
-          {english && english.toLowerCase() !== route.q.toLowerCase()
-            ? `Risultati per “${route.q}” · cercato come “${english}”`
-            : `Risultati per “${route.q}”`}
-        </p>
+        <div className="fade-in mb-6 flex flex-col items-center gap-1 text-center text-sm text-mute">
+          <p>
+            {english && english.toLowerCase() !== route.q.toLowerCase()
+              ? `Risultati per “${route.q}” · cercato come “${english}”`
+              : `Risultati per “${route.q}”`}
+          </p>
+          <p className="h-5 text-xs">
+            {checking ? (
+              <span className="inline-flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-ink" />
+                Controllo che ogni immagine mostri davvero “{english || route.q}”…
+              </span>
+            ) : hidden ? (
+              `${hidden} immagini nascoste perché non mostrano “${english || route.q}”`
+            ) : null}
+          </p>
+        </div>
       )}
+      {route.view === "search" && <ProgressBar value={checking ? 0.6 : 1} active={checking} />}
       {route.view === "saved" && (
         <h1 className="fade-in mt-4 mb-8 text-center text-3xl font-semibold tracking-tight">Salvati</h1>
       )}
@@ -415,7 +456,7 @@ function Browse({ route, cardHandlers }) {
       {loading ? (
         <SkeletonGrid />
       ) : items.length ? (
-        <Masonry items={items} onOpen={cardHandlers.onOpen} onSave={cardHandlers.onSave} />
+        <Masonry items={items} animate={route.view === "search"} onOpen={cardHandlers.onOpen} onSave={cardHandlers.onSave} />
       ) : (
         !error && (
           <p className="py-24 text-center text-mute">

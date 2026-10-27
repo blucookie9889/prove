@@ -41,6 +41,7 @@ class Embedder:
             "ViT-B-32", pretrained="laion2b_s34b_b79k"
         )
         self.clip = self.clip.to(self.device).eval()
+        self.clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
 
     @torch.inference_mode()
     def embed_batch(self, images: list[Image.Image]) -> tuple[list[list[float]], list[list[float]]]:
@@ -52,3 +53,10 @@ class Embedder:
         semantic = self.clip.encode_image(clip_input)  # (n, 512)
         semantic = torch.nn.functional.normalize(semantic, dim=-1)
         return visual.float().cpu().tolist(), semantic.float().cpu().tolist()
+
+    @torch.inference_mode()
+    def embed_text(self, prompts: list[str]) -> list[float]:
+        """Mean CLIP text embedding of ``prompts`` (a small prompt ensemble), in the ``semantic`` space."""
+        tokens = self.clip_tokenizer(prompts).to(self.device)
+        text = torch.nn.functional.normalize(self.clip.encode_text(tokens), dim=-1).mean(dim=0)
+        return torch.nn.functional.normalize(text, dim=-1).float().cpu().tolist()

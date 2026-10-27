@@ -36,6 +36,36 @@ _NOISE_CATEGORY = re.compile(
     re.IGNORECASE,
 )
 _TAG = re.compile(r"<[^>]+>")
+# Wikidata descriptions of things that are names rather than what an image can show.
+_PROPER = re.compile(
+    r"family name|given name|surname|\bfilm\b|album|\bsong\b|\bsingle\b|\bband\b|musician|singer|actor|"
+    r"actress|politician|footballer|company|character|wikimedia|disambiguation|scientific article|"
+    r"\b(?:by|from) [A-Z]",  # "painting by Armando Spadini", "single by Zucchero": a work, not a thing
+)
+
+
+def _singular(word: str) -> list[str]:
+    """Italian singulars ``word`` may be the plural of, most likely first (no dictionary needed)."""
+    for plural, singulars in (("chi", ("co", "chio")), ("ghi", ("go", "ghio")), ("che", ("ca",)), ("ghe", ("ga",)),
+                              ("ci", ("cio", "co")), ("gi", ("gio", "go")), ("ce", ("cia", "ca")), ("ge", ("gia", "ga")),
+                              ("i", ("o", "e", "a")), ("e", ("a", "o")), ("a", ("o",))):
+        if word.endswith(plural) and len(word) - len(plural) >= 2:
+            return [word[: -len(plural)] + s for s in singulars]
+    return []
+
+
+def _singulars(text: str) -> list[str]:
+    """The text itself, then versions with its words put in the singular ("foglie rosse" -> "foglia rossa")."""
+    words = text.split()
+    if len(words) == 1 and text.endswith("a"):
+        return [text]  # "foglia" is already singular; "foglio" would be another word
+    options = [[w] + _singular(w) for w in words]
+    forms = [text]
+    for depth in range(3):  # first, second and third guess for every word that has one
+        forms.append(" ".join(o[min(depth, len(o) - 1)] for o in options))
+    if len(words) > 1:  # also only the head noun in the singular ("scale a chiocciola")
+        forms += [" ".join([s] + words[1:]) for s in options[0][1:]]
+    return list(dict.fromkeys(forms))[:5]
 
 
 def _text(html: Optional[str]) -> str:
@@ -61,6 +91,9 @@ class Commons:
         if hit and time.time() - hit[0] < CACHE_TTL_S:
             return hit[1]
         resp = await self.http.get(url, params=params)
+        if resp.status_code == 429:  # back off once, politely
+            await asyncio.sleep(min(float(resp.headers.get("retry-after") or 2), 5))
+            resp = await self.http.get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
         if len(self._cache) > 5000:
@@ -118,25 +151,56 @@ class Commons:
 
     # ----------------------------------------------------------------- search & feed
 
-    async def translate(self, query: str) -> str:
-        """Map a query in any language to the English label of the matching Wikidata concept.
+    async def translate(self, query: str) -> tuple[str, Optional[str]]:
+        """Map an Italian (or any) query to the English label and id of the matching Wikidata concept.
 
         Commons file titles are mostly English, so "foglia" alone finds surnames and villages;
-        Wikidata knows it means Q33971 "leaf". Only exact label/alias matches are used.
+        Wikidata knows it means Q33971 "leaf". Only exact matches of an Italian label/alias count.
+        The words are tried as typed and in the singular ("buchi" -> "buco" -> "hole"). A capitalised
+        match for a lower-case query is a proper noun ("Buchi", a surname) and only counts if nothing
+        else matches. Names and works are dropped by their description; the rest are ranked by
+        number of Wikipedia articles, preferring labels over aliases and the form as typed.
+        Returns (query, None) when nothing fits.
         """
-        try:
-            data = await self._get(
-                WIKIDATA_API, action="wbsearchentities", search=query, language="it",
-                uselang="en", type="item", limit=5,
-            )
-        except httpx.HTTPError:
-            return query
-        q = query.strip().lower()
-        for hit in data.get("search", []):
-            match = hit.get("match", {})
-            if match.get("type") in ("label", "alias") and match.get("text", "").lower() == q and hit.get("label"):
-                return hit["label"]
-        return query
+        q = query.strip()
+        common: dict[str, dict] = {}
+        proper: dict[str, dict] = {}
+        for rank, form in enumerate(_singulars(q.lower())):
+            try:
+                data = await self._get(
+                    WIKIDATA_API, action="wbsearchentities", search=form, language="it",
+                    uselang="en", type="item", limit=10,
+                )
+            except httpx.HTTPError as exc:
+                log.warning("wikidata lookup failed: %s", exc)
+                break
+            for hit in data.get("search", []):
+                match = hit.get("match", {})
+                text = match.get("text", "")
+                if match.get("type") not in ("label", "alias") or match.get("language") != "it":
+                    continue
+                if text.lower() != form or not hit.get("label") or _PROPER.search(hit.get("description") or ""):
+                    continue
+                # Labels beat aliases ("rossa" is an alias of a pizza), the form as typed beats guesses.
+                weight = (1.0 if match["type"] == "label" else 0.3) * 0.6 ** rank
+                bucket = proper if q == q.lower() and text != text.lower() else common
+                bucket.setdefault(hit["id"], {**hit, "weight": weight})
+        hits = list((common or proper).values())
+        if not hits:
+            if " " in q:  # no concept for the whole phrase: translate word by word ("foglie rosse")
+                words = [await self.translate(w) for w in q.split()]
+                return " ".join(w for w, _ in words), next((qid for _, qid in words if qid), None)
+            return query, None
+        if len(hits) > 1:
+            try:
+                ids = "|".join(h["id"] for h in hits[:50])
+                ent = await self._get(WIKIDATA_API, action="wbgetentities", ids=ids, props="sitelinks")
+                for h in hits:
+                    h["weight"] *= 1 + len(((ent.get("entities") or {}).get(h["id"]) or {}).get("sitelinks") or {})
+            except httpx.HTTPError:
+                pass
+        best = max(hits, key=lambda h: h["weight"])
+        return best["label"], best["id"]
 
     async def search(self, query: str, offset: int = 0, limit: int = 40) -> tuple[list[dict], Optional[int]]:
         data = await self._get(
