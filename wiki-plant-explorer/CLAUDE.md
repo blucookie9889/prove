@@ -7,6 +7,9 @@ through their public APIs. Click an image to get visually similar ones; "più co
 refines the ranking, opened and saved images feed a personal "Per te" home, and a background crawler
 keeps growing a local vector index. No image is ever stored on disk: only vectors.
 
+The aim is a discovery experience, not a Pinterest clone: DINOv2 is used at every level (global look,
+patch textures, composition, parts), and lenses / the "Deriva" walk turn those into ways of wandering.
+
 ## Architecture
 
 ```
@@ -15,16 +18,20 @@ backend/sources.py   other collections (Cleveland, iNaturalist, Unsplash, Pexels
                      the Commons shape; `Budget` caps requests per hour for the keyed APIs
 backend/translator.py  local MarianMT Italian -> English
 .env                 UNSPLASH_ACCESS_KEY / PEXELS_API_KEY (git-ignored; template in .env.example)
-backend/embedder.py  DINOv2 (visual, 768-d) + OpenCLIP ViT-B-32 (semantic, 512-d), batched, L2-normalised
-backend/main.py      FastAPI: /api/foryou, /api/feed, /api/search, /api/file, /api/similar, /api/vote,
-                     /api/view, /api/saved, /api/health; background crawler
+backend/embedder.py  DINOv2 (visual, 768-d) + OpenCLIP ViT-B-32 (semantic, 512-d), batched, L2-normalised;
+                     from the same DINOv2 pass: texture, layout, parts (patch level); on demand a patch map
+backend/main.py      FastAPI: /api/foryou, /api/feed, /api/search, /api/file, /api/similar, /api/lens,
+                     /api/dino, /api/detail, /api/drift, /api/vote, /api/view, /api/saved, /api/health;
+                     background crawler and densifier
 frontend/            React 19 + Vite 6 + Tailwind 4, white image-first UI; Vite proxies /api to the backend
-qdrant_db/           embedded Qdrant: collection `commons_vectors` = vector cache (git-ignored)
+qdrant_db/           embedded Qdrant (git-ignored): `commons_vectors` (visual, semantic + item payload) and
+                     `dino_dense` (texture, layout, parts multivector + parts_xy), same point ids
 state/feedback.json  votes, saved images and opened images ("views") (git-ignored)
 state/crawler.json   crawler cursors, done categories, interest categories and queries (git-ignored)
 ```
 
-- UI language is Italian. Routes are URL params: `?q=`, `?file=<title>&q=`, `?view=saved`, `?view=featured`.
+- UI language is Italian. Routes are URL params: `?q=`, `?file=<title>&q=&lens=`, `?drift=<title>`,
+  `?view=saved`, `?view=featured`.
 - Item titles: Commons keeps `File:...`; other collections use `cma:<id>`, `inat:<observation id>`,
   `unsplash:<id>`, `pexels:<id>`. `resolve(title)` looks any of them up again (index payload first,
   so keyed APIs aren't charged); every item carries `source`.
@@ -88,12 +95,48 @@ visually), so similarity is two-stage, like Pinterest:
    embeds at most `budget` unseen candidates (frontend: 24 first, then up to 3 rounds of 64), so
    answers get better as the page refines. Calls for the same origin are serialised (`origin_lock`).
 3. Score per space = min-max(cosine to query); `final = w*visual + (1-w)*semantic` (default w=0.75).
+   The visual score is 70% global DINOv2 and 30% shared parts (`PARTS_WEIGHT`: chamfer similarity
+   of the k-means regions, weighted by their area), where both images have patch descriptors.
    Query vector = origin + 0.7*mean(più così) - 0.35*mean(meno così) for votes given on this origin
    (Rocchio). With >=2 liked images overall, a small pull (0.12) towards their mean ("taste").
 4. Greedy pick in score order, dropping near-duplicates (DINOv2 cosine > 0.94 to the origin or to an
    already picked image). `match` = raw blended cosine, shown as a % in the UI.
 
 Scrolling the similar list asks for 60 more each time (`limit` grows) and appends, keeping cards in place.
+
+## DINOv2, all of it (`dino_dense`, lenses, dettaglio, deriva)
+
+One DINOv2 pass per image (`Embedder.embed_batch`, 224 px, 16x16 patches) gives, besides the CLS
+`visual` vector:
+- `texture` (1536): mean and std of the layer-7 patch tokens (AdaIN-style statistics): materials,
+  grain, colour patterns, wherever and whatever they are.
+- `layout` (768): layer-7 tokens minus their image mean, pooled on a 4x4 grid, each cell projected to
+  48-d (fixed `RandomState(0)` QR projection — don't change it, stored vectors depend on it): composition.
+- `parts` (≤6 x 768, Qdrant MAX_SIM multivector): spherical k-means of the last-layer tokens, one
+  vector per region; `parts_xy` = each region's centre and area in image coordinates (mapped back
+  through the processor's resize-256 / centre-crop-224).
+Images indexed before these existed are backfilled by `densifier()` (re-fetch thumbs into memory,
+batches of 48, one per second, while the user is idle, cursor `dense_offset` in `state/crawler.json`); `ensure_dense`
+computes them on demand for an origin. Until the backfill is done, lenses fall back on global DINOv2.
+
+Lenses (`/api/lens?kind=`, tabs under the detail image; all ranked over the whole local index, instant):
+- `rime`: visual rhymes, same form and different subject. Pool = 1500 nearest by DINOv2; score =
+  z(form) − 1.5·z(CLIP similarity), form mixing global, layout and texture; the bottom quarter by
+  DINOv2 is excluded. Calibrated on contact sheets: shells → hermit crabs, a shell-shaped dish.
+- `materia`: texture vector. `forma`: layout vector. Beauty and near-duplicate rules as in similar.
+- `dettaglio` (`/api/detail?x=&y=`): `/api/dino` computes the origin's patch map at 448 px in its own
+  aspect ratio (`Embedder.patch_map`, cached for 8 images): tokens, PCA→RGB colours (the "Occhi di
+  DINO" overlay) and k-means segments (hover highlight). A click takes the patches of the clicked
+  segment within `DETAIL_RADIUS`, averages them and searches `parts` with MaxSim; each result gets
+  `focus` (its best-matching region), drawn as a spotlight on the card.
+
+Deriva (`/api/drift`, view `?drift=`): a walk through the index, `steps` at a time, state kept
+server-side per `walk` id. Each step draws a link type (`forma`, `materia`, `sguardo` = global DINOv2,
+`senso` = CLIP, `rima`), never the same twice in a row, takes that space's neighbours, adds momentum
+along the previous step's direction, beauty, and an absolute novelty penalty (CLIP similarity to the
+last 5 steps), then samples among the best 6 (softmax, T=0.06): no two walks are alike. `rima` in a
+walk queries the residual look (current DINOv2 vector − 0.8·mean of the last steps), which is what
+lets it leave huge series (thousands of shells on black) instead of circling in them.
 
 ## Background crawler
 

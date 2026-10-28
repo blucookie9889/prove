@@ -46,7 +46,8 @@ function vtName(title) {
 
 function readRoute() {
   const p = new URLSearchParams(window.location.search);
-  if (p.get("file")) return { view: "file", file: p.get("file"), q: p.get("q") || "" };
+  if (p.get("file")) return { view: "file", file: p.get("file"), q: p.get("q") || "", lens: p.get("lens") || "simili" };
+  if (p.get("drift")) return { view: "drift", file: p.get("drift"), q: "" };
   if (p.get("view") === "saved") return { view: "saved", q: "" };
   if (p.get("view") === "featured") return { view: "featured", q: "" };
   if (p.get("q")) return { view: "search", q: p.get("q") };
@@ -58,7 +59,9 @@ function routeUrl(r) {
   if (r.view === "file") {
     p.set("file", r.file);
     if (r.q) p.set("q", r.q);
-  } else if (r.view === "saved" || r.view === "featured") p.set("view", r.view);
+    if (r.lens && r.lens !== "simili") p.set("lens", r.lens);
+  } else if (r.view === "drift") p.set("drift", r.file);
+  else if (r.view === "saved" || r.view === "featured") p.set("view", r.view);
   else if (r.view === "search") p.set("q", r.q);
   const s = p.toString();
   return s ? `?${s}` : window.location.pathname;
@@ -118,6 +121,17 @@ const Icon = {
   out: (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M7 17 17 7M8 7h9v9" />
+    </svg>
+  ),
+  eye: (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  ),
+  drift: (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 19c4 0 4-6 8-6s4 6 8 6M4 11c4 0 4-6 8-6s4 6 8 6" />
     </svg>
   ),
   spark: (
@@ -230,6 +244,17 @@ function Card({ item, index, animated, onOpen, onSave, onVote, voting }) {
             loaded ? "opacity-100 blur-0" : "opacity-0 blur-sm"
           }`}
         />
+        {item.focus && loaded && (
+          // "Dettaglio": a soft spotlight on the region of this image that matches the picked detail.
+          <span
+            className="fade-in pointer-events-none absolute inset-0 transition duration-300 group-hover:opacity-40"
+            style={{
+              background: `radial-gradient(ellipse ${Math.round(item.focus.r * 75)}% ${Math.round(item.focus.r * 75)}% at ${
+                item.focus.x * 100
+              }% ${item.focus.y * 100}%, transparent 55%, rgba(0,0,0,0.5) 100%)`,
+            }}
+          />
+        )}
         <span className="absolute inset-0 bg-gradient-to-t from-black/55 via-black/0 to-black/0 opacity-0 transition duration-300 group-hover:opacity-100" />
         <span
           className={`absolute bottom-3 left-3 line-clamp-2 text-left text-[13px] leading-snug font-medium text-white opacity-0 transition duration-300 group-hover:translate-y-0 group-hover:opacity-100 ${
@@ -457,6 +482,15 @@ function Browse({ route, cardHandlers }) {
                 {label}
               </button>
             ))}
+            <button
+              type="button"
+              disabled={!items.length}
+              onClick={() => cardHandlers.onDrift(items[Math.floor(Math.random() * Math.min(items.length, 24))])}
+              title="Parti da un'immagine a caso di questa pagina e lasciati portare"
+              className="flex items-center gap-1.5 rounded-full px-5 py-2 text-sm font-semibold text-mute transition hover:text-ink disabled:opacity-40"
+            >
+              {Icon.drift} Deriva
+            </button>
           </div>
           <p className="text-xs text-mute">
             {route.view === "feed" && !personal
@@ -557,6 +591,122 @@ function Trail({ trail, current, onOpen }) {
   );
 }
 
+const LENSES = [
+  ["simili", "Simili", "Aspetto e soggetto, affinati dai tuoi + e −"],
+  ["rime", "Rime", "Stessa forma, un altro mondo: DINOv2 le vede uguali, CLIP no"],
+  ["materia", "Materia", "Stesse superfici, grane e colori, qualunque cosa sia"],
+  ["forma", "Forma", "Stessa composizione: dove stanno masse, linee e vuoti"],
+  ["dettaglio", "Dettaglio", "Tocca un punto dell'immagine: cerco dove altro compare"],
+];
+
+const LINKS = {
+  forma: "stessa composizione",
+  materia: "stessa materia",
+  sguardo: "stesso aspetto",
+  senso: "stesso soggetto",
+  rima: "rima visiva",
+};
+
+function bytes(b64) {
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+/** Paint a w x h grid (one value per DINOv2 patch) into a canvas; the browser smooths it when scaled up. */
+function paintGrid(canvas, w, h, pixel) {
+  if (!canvas) return;
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(w, h);
+  for (let i = 0; i < w * h; i += 1) img.data.set(pixel(i), i * 4);
+  ctx.putImageData(img, 0, 0);
+}
+
+/**
+ * The big image. With ``eyes`` on, DINOv2's view of it is laid over: the first three principal
+ * components of its patch tokens as colours (patches of the same kind of thing share a colour).
+ * With ``picking`` on, the region under the pointer lights up and a click picks a detail.
+ */
+function Hero({ origin, map, eyes, picking, pick, mask, onPick }) {
+  const [bigLoaded, setBigLoaded] = useState(false);
+  const [hoverSeg, setHoverSeg] = useState(-1);
+  const colours = useRef(null);
+  const shade = useRef(null);
+  const ratio = origin?.width && origin?.height ? origin.width / origin.height : map ? map.w / map.h : 4 / 3;
+
+  useEffect(() => {
+    if (!map) return;
+    const rgb = map.rgbBytes;
+    paintGrid(colours.current, map.w, map.h, (i) => [rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2], 255]);
+  }, [map]);
+
+  // Darken everything but the hovered region (or, after a click, the patches that were picked).
+  useEffect(() => {
+    if (!map) return;
+    const seg = map.segBytes;
+    const lit = mask ? (i) => mask[i] : hoverSeg >= 0 ? (i) => seg[i] === hoverSeg : null;
+    paintGrid(shade.current, map.w, map.h, (i) => (lit && !lit(i) ? [0, 0, 0, 150] : [0, 0, 0, 0]));
+  }, [map, hoverSeg, mask]);
+
+  const at = (e) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    return { x: Math.min(0.999, Math.max(0, (e.clientX - r.left) / r.width)), y: Math.min(0.999, Math.max(0, (e.clientY - r.top) / r.height)) };
+  };
+
+  return (
+    <div
+      className="relative mx-auto overflow-hidden rounded-3xl bg-wash shadow-[0_30px_60px_-30px_rgba(0,0,0,0.35)]"
+      style={{ aspectRatio: `${ratio}`, width: `min(100%, calc(78vh * ${ratio}))` }}
+    >
+      {origin?.thumb ? (
+        <>
+          {/* The grid thumbnail is already cached: show it at once (it is what the card morphs into). */}
+          <img data-hero src={origin.thumb} alt={origin.name} className="h-full w-full object-cover" style={{ viewTransitionName: "hero" }} />
+          <img
+            src={bigThumb(origin)}
+            alt=""
+            onLoad={() => setBigLoaded(true)}
+            className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-700 ${bigLoaded ? "opacity-100" : "opacity-0"}`}
+          />
+        </>
+      ) : (
+        <div className="shimmer h-full w-full" />
+      )}
+      <canvas
+        ref={colours}
+        className={`pointer-events-none absolute inset-0 h-full w-full transition-opacity duration-700 ${map && eyes ? "opacity-90" : "opacity-0"}`}
+      />
+      <canvas
+        ref={shade}
+        className={`pointer-events-none absolute inset-0 h-full w-full transition-opacity duration-300 ${map && picking ? "opacity-100" : "opacity-0"}`}
+      />
+      {picking && map && (
+        <button
+          type="button"
+          aria-label="Scegli un dettaglio"
+          className="absolute inset-0 cursor-crosshair"
+          onMouseMove={(e) => {
+            if (mask) return;
+            const { x, y } = at(e);
+            setHoverSeg(map.segBytes[Math.floor(y * map.h) * map.w + Math.floor(x * map.w)]);
+          }}
+          onMouseLeave={() => setHoverSeg(-1)}
+          onClick={(e) => onPick(at(e))}
+        />
+      )}
+      {picking && pick && (
+        <span
+          key={`${pick.x},${pick.y}`}
+          className="pointer-events-none absolute h-9 w-9 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-[0_0_0_1px_rgba(0,0,0,0.25)]"
+          style={{ left: `${pick.x * 100}%`, top: `${pick.y * 100}%` }}
+        >
+          <span className="absolute inset-0 animate-ping rounded-full border-2 border-white [animation-iteration-count:2]" />
+        </span>
+      )}
+    </div>
+  );
+}
+
 function Detail({ route, preview, cardHandlers, onBack }) {
   const [origin, setOrigin] = useState(preview);
   const [items, setItems] = useState([]);
@@ -565,12 +715,97 @@ function Detail({ route, preview, cardHandlers, onBack }) {
   const [info, setInfo] = useState({ pending: 0, candidates: 0, more: false });
   const [voting, setVoting] = useState(false);
   const [error, setError] = useState("");
-  const [bigLoaded, setBigLoaded] = useState(false);
   const [trail, setTrail] = useState(readTrail);
   const run = useRef(0);
   const shown = useRef(false);
 
   const limit = useRef(SIMILAR_PAGE);
+
+  // Lenses other than "simili": each a different way of being alike, ranked over the whole index.
+  const [lens, setLens] = useState(route.lens || "simili");
+  const [lensItems, setLensItems] = useState([]);
+  const [lensBusy, setLensBusy] = useState(false);
+  const [lensMore, setLensMore] = useState(false);
+  const [map, setMap] = useState(null);
+  const [eyes, setEyes] = useState(false);
+  const [pick, setPick] = useState(null);
+  const [mask, setMask] = useState(null);
+  const [progress, setProgress] = useState(null);
+  const lensLimit = useRef(SIMILAR_PAGE);
+  const lensRun = useRef(0);
+
+  const chooseLens = (next) => {
+    setLens(next);
+    window.history.replaceState(null, "", routeUrl({ ...route, lens: next }));
+  };
+
+  // DINOv2's patch map of the origin: for its "eyes" and for picking a detail.
+  useEffect(() => {
+    if (map || (!eyes && lens !== "dettaglio")) return;
+    api(`/dino?title=${encodeURIComponent(route.file)}`)
+      .then((m) => setMap({ ...m, rgbBytes: bytes(m.rgb), segBytes: bytes(m.segments) }))
+      .catch(() => {});
+  }, [eyes, lens, map, route.file]);
+
+  useEffect(() => {
+    if (lens === "simili") return;
+    api("/health")
+      .then((h) => setProgress({ dense: h.dense, indexed: h.indexed }))
+      .catch(() => {});
+  }, [lens]);
+
+  const fetchLens = useCallback(
+    async (append) => {
+      if (lens === "simili" || (lens === "dettaglio" && !pick)) return;
+      const id = ++lensRun.current;
+      setLensBusy(true);
+      try {
+        const qs = new URLSearchParams({ title: route.file, limit: String(lensLimit.current) });
+        let data;
+        if (lens === "dettaglio") {
+          qs.set("x", String(pick.x));
+          qs.set("y", String(pick.y));
+          data = await api(`/detail?${qs}`);
+          if (id === lensRun.current) setMask(bytes(data.mask));
+        } else {
+          qs.set("kind", lens);
+          data = await api(`/lens?${qs}`);
+        }
+        if (id !== lensRun.current) return;
+        const apply = () =>
+          setLensItems((prev) => {
+            if (!append) return data.items;
+            const seen = new Set(prev.map((p) => p.title));
+            return [...prev, ...data.items.filter((i) => !seen.has(i.title))];
+          });
+        if (append) apply();
+        else withTransition(apply);
+        setLensMore(data.items.length >= lensLimit.current);
+        setError("");
+      } catch (e) {
+        if (id === lensRun.current) setError(e.message);
+      } finally {
+        if (id === lensRun.current) setLensBusy(false);
+      }
+    },
+    [lens, pick, route.file],
+  );
+
+  useEffect(() => {
+    lensLimit.current = SIMILAR_PAGE;
+    setLensItems([]);
+    setLensMore(false);
+    if (lens !== "dettaglio") {
+      setPick(null);
+      setMask(null);
+    }
+    fetchLens(false);
+  }, [fetchLens, lens]);
+
+  const lensLoadMore = useCallback(() => {
+    lensLimit.current += SIMILAR_PAGE;
+    fetchLens(true);
+  }, [fetchLens]);
 
   const fetchSimilar = useCallback(
     async (budget, w) => {
@@ -687,19 +922,33 @@ function Detail({ route, preview, cardHandlers, onBack }) {
   }, [refresh, weight]);
 
   const analysed = info.candidates - info.pending;
-  const busy = phase === "loading" || phase === "refining";
-  const status =
-    phase === "loading"
+  const similar = lens === "simili";
+  const busy = similar ? phase === "loading" || phase === "refining" : lensBusy;
+  const lensInfo = LENSES.find(([k]) => k === lens) || LENSES[0];
+  const learning =
+    progress && progress.dense < progress.indexed
+      ? `DINOv2 sta studiando l'indice: ${progress.dense.toLocaleString("it-IT")} di ${progress.indexed.toLocaleString("it-IT")} immagini`
+      : progress
+        ? `${progress.indexed.toLocaleString("it-IT")} immagini nell'indice`
+        : "";
+  const status = !similar
+    ? lens === "dettaglio" && !pick
+      ? "Tocca l'immagine qui sopra"
+      : lensBusy
+        ? "Cerco nell'indice…"
+        : error || learning
+    : phase === "loading"
       ? "Guardo le immagini collegate…"
       : phase === "refining"
         ? `Affino · ${analysed} di ${info.candidates} immagini analizzate`
         : phase === "error"
           ? error
           : `${analysed} immagini analizzate${info.pending ? ` · ${info.pending} ancora da guardare` : ""}`;
+  const shownItems = similar ? items : lensItems;
 
   return (
     <main className="relative px-4 pb-16 md:px-6">
-      <ProgressBar value={info.candidates ? analysed / info.candidates : 0.08} active={busy} />
+      <ProgressBar value={similar ? (info.candidates ? analysed / info.candidates : 0.08) : 0.6} active={busy} />
 
       {/* Ambient glow made of the image's own colours */}
       {origin?.thumb && (
@@ -708,7 +957,7 @@ function Detail({ route, preview, cardHandlers, onBack }) {
         </div>
       )}
 
-      <section className="mx-auto mb-14 grid max-w-6xl gap-6 md:mt-2 md:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)] md:gap-10">
+      <section className="mx-auto mb-12 grid max-w-6xl gap-6 md:mt-2 md:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)] md:gap-10">
         <div className="relative">
           <button
             type="button"
@@ -718,31 +967,28 @@ function Detail({ route, preview, cardHandlers, onBack }) {
           >
             {Icon.back}
           </button>
-          <div className="relative overflow-hidden rounded-3xl bg-wash shadow-[0_30px_60px_-30px_rgba(0,0,0,0.35)]">
-            {origin?.thumb ? (
-              <>
-                {/* The grid thumbnail is already cached: show it at once (it is what the card morphs into). */}
-                <img
-                  data-hero
-                  src={origin.thumb}
-                  alt={origin.name}
-                  className="mx-auto max-h-[78vh] w-full object-contain"
-                  style={{
-                    viewTransitionName: "hero",
-                    aspectRatio: origin.width && origin.height ? `${origin.width} / ${origin.height}` : undefined,
-                  }}
-                />
-                <img
-                  src={bigThumb(origin)}
-                  alt=""
-                  onLoad={() => setBigLoaded(true)}
-                  className={`absolute inset-0 h-full w-full object-contain transition-opacity duration-700 ${bigLoaded ? "opacity-100" : "opacity-0"}`}
-                />
-              </>
-            ) : (
-              <div className="shimmer aspect-[4/3]" />
-            )}
-          </div>
+          <button
+            type="button"
+            onClick={() => setEyes((v) => !v)}
+            className={`absolute top-3 right-3 z-10 flex items-center gap-1.5 rounded-full px-3.5 py-2 text-[13px] font-semibold shadow-sm transition hover:scale-105 ${
+              eyes ? "bg-ink text-white" : "bg-white/95 text-ink"
+            }`}
+            title="Colora l'immagine come la vede DINOv2: parti dello stesso tipo, stesso colore"
+          >
+            {Icon.eye} Occhi di DINO
+          </button>
+          <Hero
+            origin={origin}
+            map={map}
+            eyes={eyes}
+            picking={lens === "dettaglio"}
+            pick={pick}
+            mask={mask}
+            onPick={(p) => {
+              setMask(null);
+              setPick(p);
+            }}
+          />
         </div>
 
         <aside className="flex flex-col gap-6 md:pt-2">
@@ -764,6 +1010,14 @@ function Detail({ route, preview, cardHandlers, onBack }) {
               >
                 {origin.saved ? "Salvata" : "Salva"}
               </button>
+              <button
+                type="button"
+                onClick={() => cardHandlers.onDrift(origin)}
+                className="flex items-center gap-1.5 rounded-full bg-wash px-5 py-3 text-sm font-semibold transition hover:bg-line"
+                title="Un viaggio da qui: ogni passo somiglia al precedente in un modo diverso"
+              >
+                {Icon.drift} Deriva da qui
+              </button>
               {origin.page_url && (
                 <a
                   href={origin.page_url}
@@ -771,77 +1025,231 @@ function Detail({ route, preview, cardHandlers, onBack }) {
                   rel="noreferrer"
                   className="flex items-center gap-1.5 rounded-full bg-wash px-5 py-3 text-sm font-semibold transition hover:bg-line"
                 >
-                  Apri su {origin.source || "Wikimedia Commons"} {Icon.out}
+                  {origin.source || "Wikimedia Commons"} {Icon.out}
                 </a>
               )}
             </div>
           )}
 
-          <div className="rounded-2xl border border-line bg-white/70 p-5 backdrop-blur">
-            <div className="mb-3 flex items-baseline justify-between">
-              <span className="text-sm font-semibold">Simili per</span>
-              <span key={lookLabel(weight)} className="fade-in text-sm text-mute">
-                {lookLabel(weight)}
-              </span>
+          {similar ? (
+            <div className="rounded-2xl border border-line bg-white/70 p-5 backdrop-blur">
+              <div className="mb-3 flex items-baseline justify-between">
+                <span className="text-sm font-semibold">Simili per</span>
+                <span key={lookLabel(weight)} className="fade-in text-sm text-mute">
+                  {lookLabel(weight)}
+                </span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={weight}
+                onChange={(e) => setWeight(Number(e.target.value))}
+                className="look-range"
+                aria-label="Aspetto o soggetto"
+              />
+              <div className="mt-2 flex justify-between text-xs text-mute">
+                <span>Soggetto</span>
+                <span>Aspetto</span>
+              </div>
+              <p className="mt-4 text-xs leading-relaxed text-mute">
+                Passa sopra un'immagine e usa <b className="text-ink">+</b> per “più così” o <b className="text-ink">−</b> per
+                “meno così”: i risultati si riordinano e l'app impara i tuoi gusti.
+              </p>
             </div>
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={weight}
-              onChange={(e) => setWeight(Number(e.target.value))}
-              className="look-range"
-              aria-label="Aspetto o soggetto"
-            />
-            <div className="mt-2 flex justify-between text-xs text-mute">
-              <span>Soggetto</span>
-              <span>Aspetto</span>
+          ) : (
+            <div key={lens} className="fade-in rounded-2xl border border-line bg-white/70 p-5 backdrop-blur">
+              <p className="text-sm font-semibold">{lensInfo[1]}</p>
+              <p className="mt-1.5 text-sm leading-relaxed text-mute">{lensInfo[2]}</p>
+              {lens === "dettaglio" && (
+                <p className="mt-3 text-xs leading-relaxed text-mute">
+                  DINOv2 divide l'immagine in regioni: passa sopra per vederle, clicca per sceglierne una. Nei risultati la parte che
+                  corrisponde resta in luce.
+                </p>
+              )}
             </div>
-            <p className="mt-4 text-xs leading-relaxed text-mute">
-              Passa sopra un'immagine e usa <b className="text-ink">+</b> per “più così” o <b className="text-ink">−</b> per
-              “meno così”: i risultati si riordinano e l'app impara i tuoi gusti.
-            </p>
-          </div>
+          )}
 
           <Trail trail={trail} current={route.file} onOpen={(t) => cardHandlers.onOpen(t)} />
         </aside>
       </section>
 
-      <div className="mx-auto mb-5 flex max-w-6xl items-center justify-between gap-4">
-        <h2 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
-          Simili
-          {busy && <span className="text-mute">{Icon.spark}</span>}
-        </h2>
-        <span className="flex items-center gap-2 text-right text-xs text-mute">
+      <div className="mx-auto mb-6 flex max-w-6xl flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div className="-mx-4 flex gap-1 overflow-x-auto px-4 md:mx-0 md:px-0">
+          {LENSES.map(([key, label, hint]) => (
+            <button
+              key={key}
+              type="button"
+              title={hint}
+              onClick={() => chooseLens(key)}
+              className={`shrink-0 rounded-full px-4 py-2 text-[15px] font-semibold tracking-tight transition ${
+                lens === key ? "bg-ink text-white" : "text-mute hover:bg-wash hover:text-ink"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <span className="flex items-center gap-2 text-xs text-mute md:text-right">
           {busy && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-ink" />}
           {status}
         </span>
       </div>
 
-      {phase === "loading" && !items.length ? (
+      {(similar ? phase === "loading" : lensBusy) && !shownItems.length ? (
         <SkeletonGrid n={12} />
-      ) : items.length ? (
+      ) : shownItems.length ? (
         <Masonry
-          items={items}
+          items={shownItems}
           animate
           onOpen={cardHandlers.onOpen}
           onSave={cardHandlers.onSave}
-          onVote={onVote}
+          onVote={similar ? onVote : undefined}
           voting={voting}
         />
+      ) : lens === "dettaglio" && !pick ? (
+        <p className="py-16 text-center text-mute">Scegli un punto dell'immagine: una foglia, un occhio, una finestra, una crepa.</p>
       ) : (
-        phase !== "loading" &&
-        phase !== "error" && <p className="py-16 text-center text-mute">Nessuna immagine simile trovata.</p>
+        !busy &&
+        phase !== "error" && <p className="py-16 text-center text-mute">Nessuna immagine trovata.</p>
       )}
 
-      <InfiniteSentinel onVisible={loadMore} active={phase === "ready" && (info.pending > 0 || info.more)} />
-      {phase === "refining" && items.length > 0 && (
+      {similar ? (
+        <InfiniteSentinel onVisible={loadMore} active={phase === "ready" && (info.pending > 0 || info.more)} />
+      ) : (
+        <InfiniteSentinel onVisible={lensLoadMore} active={!lensBusy && lensMore} />
+      )}
+      {busy && shownItems.length > 0 && (
         <p className="mt-8 flex items-center justify-center gap-2 text-sm text-mute">
           <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-ink" />
-          Cerco altre immagini simili…
+          Cerco altre immagini…
         </p>
       )}
+    </main>
+  );
+}
+
+/* ------------------------------------------------------------------ drift ("deriva") */
+
+const DRIFT_STEPS = 8;
+
+/**
+ * A walk through the index: each image is alike to the one before it in one way (composition,
+ * material, look, subject, or a visual rhyme), and the way changes at every step. The server draws
+ * among the best few candidates, so no two walks are the same.
+ */
+function Drift({ route, cardHandlers }) {
+  const [start, setStart] = useState(null);
+  const [steps, setSteps] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [ended, setEnded] = useState(false);
+  const [error, setError] = useState("");
+  const [round, setRound] = useState(0);
+  const walk = useRef(null);
+  const loading = useRef(false);
+  const current = useRef(round);
+  current.current = round;
+  const moreRef = useRef(null);
+
+  const more = useCallback(async () => {
+    if (loading.current) return;
+    loading.current = true;
+    setBusy(true);
+    const mine = round;
+    try {
+      const qs = new URLSearchParams({ title: route.file, steps: String(DRIFT_STEPS) });
+      if (walk.current) qs.set("walk", walk.current);
+      const data = await api(`/drift?${qs}`);
+      if (mine !== current.current) return; // "Ricomincia" was pressed meanwhile
+      walk.current = data.walk;
+      setSteps((prev) => [...prev, ...data.steps]);
+      setEnded(data.steps.length === 0);
+      setError("");
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      loading.current = false;
+      setBusy(false);
+      // A restart pressed while this step was loading: start the new walk now.
+      if (mine !== current.current) moreRef.current();
+    }
+  }, [route.file, round]);
+  moreRef.current = more;
+
+  useEffect(() => {
+    api(`/file?title=${encodeURIComponent(route.file)}`)
+      .then(setStart)
+      .catch(() => {});
+  }, [route.file]);
+
+  useEffect(() => {
+    walk.current = null;
+    setSteps([]);
+    setEnded(false);
+    more();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [route.file, round]);
+
+  useEffect(() => {
+    const onSaved = (e) => setSteps((prev) => prev.map((p) => (p.title === e.detail.title ? { ...p, saved: e.detail.saved } : p)));
+    window.addEventListener("saved-changed", onSaved);
+    return () => window.removeEventListener("saved-changed", onSaved);
+  }, []);
+
+  return (
+    <main className="px-4 pb-24 md:px-6">
+      <ProgressBar value={0.6} active={busy} />
+      <div className="fade-in mx-auto mt-6 mb-12 flex max-w-xl flex-col items-center text-center">
+        <p className="mb-3 text-xs font-semibold tracking-[0.2em] text-mute uppercase">Deriva</p>
+        {start?.thumb && (
+          <button type="button" onClick={() => cardHandlers.onOpen(start)} className="mb-5 h-24 w-24 overflow-hidden rounded-full bg-wash shadow-lg ring-4 ring-white transition hover:scale-105">
+            <img src={start.thumb} alt={start.name} className="h-full w-full object-cover" />
+          </button>
+        )}
+        <h1 className="text-2xl font-semibold tracking-tight">{start?.name || " "}</h1>
+        <p className="mt-3 text-sm leading-relaxed text-mute">
+          Ogni immagine somiglia alla precedente in un modo diverso: per composizione, materia, aspetto, soggetto o per rima
+          visiva. Nessuna deriva è uguale a un'altra.
+        </p>
+        <button
+          type="button"
+          onClick={() => setRound((r) => r + 1)}
+          className="mt-5 flex items-center gap-1.5 rounded-full bg-wash px-5 py-2.5 text-sm font-semibold transition hover:bg-line"
+        >
+          {Icon.drift} Ricomincia da qui
+        </button>
+      </div>
+
+      <ol className="mx-auto flex max-w-2xl flex-col items-center">
+        {steps.map((s, i) => (
+          <li key={`${s.title}-${i}`} className="rise flex w-full flex-col items-center" style={{ "--i": i % DRIFT_STEPS }}>
+            <div className="flex flex-col items-center py-3">
+              <span className="h-8 w-px bg-line" />
+              <span className="my-1.5 rounded-full border border-line bg-white px-3 py-1 text-xs font-medium text-mute">
+                {LINKS[s.link] || s.link}
+                {s.match != null && <span className="ml-1.5 tabular-nums opacity-60">{Math.round(s.match * 100)}%</span>}
+              </span>
+              <span className="h-8 w-px bg-line" />
+            </div>
+            <div className={`w-full max-w-[560px] ${i % 2 ? "md:translate-x-16" : "md:-translate-x-16"}`}>
+              <Card item={s} index={0} onOpen={cardHandlers.onOpen} onSave={cardHandlers.onSave} />
+            </div>
+          </li>
+        ))}
+      </ol>
+
+      {error && <p className="py-10 text-center text-mute">{error}</p>}
+      {ended && steps.length > 0 && (
+        <p className="py-10 text-center text-sm text-mute">La deriva si è fermata qui: l'indice non ha altro di abbastanza vicino.</p>
+      )}
+      {busy && (
+        <p className="mt-10 flex items-center justify-center gap-2 text-sm text-mute">
+          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-ink" />
+          Scelgo il prossimo passo…
+        </p>
+      )}
+      <InfiniteSentinel onVisible={more} active={!busy && !ended && !error && steps.length > 0} />
     </main>
   );
 }
@@ -906,7 +1314,13 @@ export default function App() {
     [go, route],
   );
 
-  const cardHandlers = { onOpen, onSave, onSearch: (q) => go({ view: "search", q }), onNav: (view) => go({ view, q: "" }) };
+  const cardHandlers = {
+    onOpen,
+    onSave,
+    onSearch: (q) => go({ view: "search", q }),
+    onNav: (view) => go({ view, q: "" }),
+    onDrift: (item) => withTransition(() => go({ view: "drift", file: item.title, q: "" })),
+  };
 
   return (
     <div className="min-h-screen">
@@ -917,7 +1331,9 @@ export default function App() {
         onHome={() => go({ view: "feed", q: "" })}
         onSaved={() => go({ view: "saved", q: "" })}
       />
-      {route.view === "file" ? (
+      {route.view === "drift" ? (
+        <Drift key={route.file} route={route} cardHandlers={cardHandlers} />
+      ) : route.view === "file" ? (
         <Detail
           key={route.file}
           route={route}
