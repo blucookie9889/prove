@@ -95,107 +95,41 @@ function pushTrail(item, anchor) {
   return next;
 }
 
-/* ------------------------------------------------------------------ icons */
-
-const Icon = {
-  search: (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
-      <circle cx="11" cy="11" r="7" />
-      <path d="m20 20-3.5-3.5" />
-    </svg>
-  ),
-  plus: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round">
-      <path d="M12 5v14M5 12h14" />
-    </svg>
-  ),
-  minus: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round">
-      <path d="M5 12h14" />
-    </svg>
-  ),
-  back: (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M15 18l-6-6 6-6" />
-    </svg>
-  ),
-  out: (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M7 17 17 7M8 7h9v9" />
-    </svg>
-  ),
-  spark: (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-      <path d="M12 2l1.9 6.1L20 10l-6.1 1.9L12 18l-1.9-6.1L4 10l6.1-1.9z" />
-    </svg>
-  ),
-};
-
 /* ------------------------------------------------------------------ header */
 
+/** One quiet line: the name, the search (plain text over a hairline), the saved count. */
 function Header({ route, savedCount, onSearch, onHome, onSaved }) {
   const [text, setText] = useState(route.view === "search" ? route.q : "");
-  const [scrolled, setScrolled] = useState(false);
 
   useEffect(() => {
     if (route.view === "search") setText(route.q);
     if (route.view === "feed") setText("");
   }, [route]);
 
-  useEffect(() => {
-    const onScroll = () => setScrolled(window.scrollY > 8);
-    onScroll();
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
-  }, []);
-
   return (
-    <header
-      className={`sticky top-0 z-30 bg-white/85 backdrop-blur-xl transition-shadow duration-300 ${
-        scrolled ? "shadow-[0_1px_0_rgba(0,0,0,0.06),0_8px_24px_-12px_rgba(0,0,0,0.12)]" : ""
-      }`}
-    >
-      <div className="flex h-[72px] items-center gap-3 px-4 md:gap-5 md:px-6">
-        <button type="button" onClick={onHome} className="group flex shrink-0 items-center gap-2" aria-label="Home">
-          <span className="grid h-9 w-9 grid-cols-2 gap-[3px] rounded-[10px] bg-ink p-[7px] transition-transform duration-300 group-hover:rotate-[-8deg]">
-            <span className="rounded-[2px] bg-white" />
-            <span className="mt-1 rounded-[2px] bg-white" />
-            <span className="-mt-1 rounded-[2px] bg-white" />
-            <span className="rounded-[2px] bg-white" />
-          </span>
-          <span className="hidden text-[15px] font-semibold tracking-tight sm:inline">Wiki Explorer</span>
+    <header className="sticky top-0 z-30 bg-paper/90 backdrop-blur-md">
+      <div className="mx-auto flex h-16 max-w-[1500px] items-center gap-6 px-6">
+        <button type="button" onClick={onHome} className="shrink-0 text-ink">
+          Wiki Explorer
         </button>
-
         <form
-          className="relative min-w-0 flex-1"
+          className="min-w-0 flex-1"
           onSubmit={(e) => {
             e.preventDefault();
             if (text.trim()) onSearch(text.trim());
           }}
         >
-          <span className="pointer-events-none absolute top-1/2 left-4 -translate-y-1/2 text-mute">{Icon.search}</span>
           <input
             value={text}
             onChange={(e) => setText(e.target.value)}
-            placeholder="Cerca tra milioni di immagini libere"
-            className="h-12 w-full rounded-full bg-wash pr-4 pl-11 text-[15px] transition outline-none placeholder:text-mute focus:bg-white focus:shadow-[0_0_0_1px_rgba(0,0,0,0.08),0_8px_30px_-8px_rgba(0,0,0,0.18)]"
+            placeholder="Cerca"
+            aria-label="Cerca tra le immagini libere"
+            className="calm w-full border-b border-rule-2 bg-transparent py-1.5 text-ink transition-colors outline-none focus:border-ink"
             enterKeyHint="search"
           />
         </form>
-
-        <button
-          type="button"
-          onClick={onSaved}
-          className={`shrink-0 rounded-full px-4 py-2.5 text-sm font-semibold transition ${
-            route.view === "saved" ? "bg-ink text-white" : "hover:bg-wash"
-          }`}
-        >
-          Salvati
-          {savedCount > 0 && (
-            <span key={savedCount} className="fade-in ml-1.5 inline-block opacity-60">
-              {savedCount}
-            </span>
-          )}
+        <button type="button" onClick={onSaved} className={`calm shrink-0 transition-colors ${route.view === "saved" ? "text-ink" : "text-mute hover:text-ink"}`}>
+          Salvati{savedCount > 0 && <span className="ml-1.5 text-mute">{savedCount}</span>}
         </button>
       </div>
     </header>
@@ -204,6 +138,10 @@ function Header({ route, savedCount, onSearch, onHome, onSaved }) {
 
 /* ------------------------------------------------------------------ cards & grid */
 
+/**
+ * An image in a grid. Nothing on it at rest; on hover a line of muted text appears below it
+ * (its name, and the quiet actions). The grid makes the other images recede.
+ */
 function Card({ item, index, animated, onOpen, onSave, onVote, voting }) {
   const [loaded, setLoaded] = useState(false);
   const ratio = item.width && item.height ? `${item.width} / ${item.height}` : "4 / 5";
@@ -217,9 +155,7 @@ function Card({ item, index, animated, onOpen, onSave, onVote, voting }) {
       <button
         type="button"
         onClick={() => onOpen(item, imgRef.current)}
-        className={`relative block w-full overflow-hidden rounded-2xl bg-wash transition duration-300 ${
-          item.vote === 1 ? "ring-2 ring-ink ring-offset-2" : ""
-        }`}
+        className={`placeholder relative block w-full overflow-hidden rounded-[2px] ${item.vote === 1 ? "outline outline-1 outline-offset-2 outline-ink" : ""}`}
         style={{ aspectRatio: ratio }}
         aria-label={item.name}
       >
@@ -230,72 +166,33 @@ function Card({ item, index, animated, onOpen, onSave, onVote, voting }) {
           loading="lazy"
           decoding="async"
           onLoad={() => setLoaded(true)}
-          className={`h-full w-full object-cover transition duration-700 ease-out group-hover:scale-[1.04] ${
-            loaded ? "opacity-100 blur-0" : "opacity-0 blur-sm"
-          }`}
+          className={`calm h-full w-full object-cover transition-[opacity,filter] ${loaded ? "opacity-100 blur-0" : "opacity-0 blur-[2px]"}`}
         />
-        <span className="absolute inset-0 bg-gradient-to-t from-black/55 via-black/0 to-black/0 opacity-0 transition duration-300 group-hover:opacity-100" />
-        <span
-          className={`absolute bottom-3 left-3 line-clamp-2 text-left text-[13px] leading-snug font-medium text-white opacity-0 transition duration-300 group-hover:translate-y-0 group-hover:opacity-100 ${
-            onVote ? "right-24" : "right-3"
-          } translate-y-1`}
-        >
-          {item.name}
-          {item.source && item.source !== "Wikimedia Commons" && (
-            <span className="mt-0.5 block text-[11px] font-normal text-white/75">{item.source}</span>
-          )}
-        </span>
       </button>
-
-      {item.match != null && (
-        <span className="absolute top-2.5 left-2.5 rounded-full bg-white/90 px-2.5 py-1 text-[11px] font-semibold tabular-nums opacity-0 shadow-sm backdrop-blur transition group-hover:opacity-100">
-          {Math.round(item.match * 100)}%
-        </span>
-      )}
-
-      <button
-        type="button"
-        onClick={() => onSave(item)}
-        className={`absolute top-2.5 right-2.5 rounded-full px-3.5 py-2 text-[13px] font-semibold transition duration-200 active:scale-95 ${
-          item.saved
-            ? "bg-ink text-white opacity-100"
-            : "bg-white/95 text-ink opacity-0 shadow-sm group-hover:opacity-100 focus:opacity-100"
-        }`}
-      >
-        {item.saved ? "Salvata" : "Salva"}
-      </button>
-
-      {onVote && (
-        <div className="absolute right-2.5 bottom-2.5 flex gap-1.5 opacity-0 transition duration-200 group-hover:opacity-100 focus-within:opacity-100">
-          <button
-            type="button"
-            disabled={voting}
-            onClick={() => onVote(item, item.vote === 1 ? 0 : 1)}
-            title="Più così: affina i risultati verso questa immagine"
-            className={`grid h-9 w-9 place-items-center rounded-full shadow-sm transition active:scale-90 ${
-              item.vote === 1 ? "bg-ink text-white" : "bg-white/95 text-ink hover:bg-white"
-            }`}
-          >
-            {Icon.plus}
-          </button>
-          <button
-            type="button"
-            disabled={voting}
-            onClick={() => onVote(item, -1)}
-            title="Meno così: allontana i risultati da questa immagine"
-            className="grid h-9 w-9 place-items-center rounded-full bg-white/95 text-ink shadow-sm transition hover:bg-white active:scale-90"
-          >
-            {Icon.minus}
-          </button>
-        </div>
-      )}
+      <figcaption className="calm flex items-baseline gap-3 pt-1.5 pb-1 text-mute opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100">
+        <span className="min-w-0 flex-1 truncate">{item.name}</span>
+        {item.match != null && <span>{Math.round(item.match * 100)}</span>}
+        {onVote && (
+          <>
+            <button type="button" disabled={voting} onClick={() => onVote(item, item.vote === 1 ? 0 : 1)} className="link shrink-0" title="Più così: affina i risultati verso questa immagine">
+              più
+            </button>
+            <button type="button" disabled={voting} onClick={() => onVote(item, -1)} className="link shrink-0" title="Meno così: allontana i risultati da questa immagine">
+              meno
+            </button>
+          </>
+        )}
+        <button type="button" onClick={() => onSave(item)} className={`link shrink-0 ${item.saved ? "text-ink" : ""}`}>
+          {item.saved ? "salvata" : "salva"}
+        </button>
+      </figcaption>
     </figure>
   );
 }
 
 function Masonry({ items, animate = false, ...handlers }) {
   return (
-    <div className="masonry">
+    <div className="masonry recede">
       {items.map((it, i) => (
         <Card key={it.title} item={it} index={i} animated={animate && i < ANIMATED_CARDS} {...handlers} />
       ))}
@@ -304,11 +201,11 @@ function Masonry({ items, animate = false, ...handlers }) {
 }
 
 function SkeletonGrid({ n = 18 }) {
-  const heights = [260, 340, 200, 300, 380, 240, 320, 220, 280];
+  const ratios = [0.8, 1.25, 0.75, 1, 1.4, 0.9, 1.1, 0.7, 1.2];
   return (
     <div className="masonry">
       {Array.from({ length: n }, (_, i) => (
-        <div key={i} className="shimmer rounded-2xl" style={{ height: heights[i % heights.length] }} />
+        <div key={i} className="placeholder fade-in rounded-[2px]" style={{ aspectRatio: ratios[i % ratios.length] }} />
       ))}
     </div>
   );
@@ -325,14 +222,25 @@ function InfiniteSentinel({ onVisible, active }) {
   return <div ref={ref} className="h-px" />;
 }
 
+/** A 1px line at the very top that grows slowly while something loads. */
 function ProgressBar({ value, active }) {
   return (
-    <div className="pointer-events-none fixed inset-x-0 top-0 z-40 h-[3px]">
+    <div className="pointer-events-none fixed inset-x-0 top-0 z-40 h-px">
       <div
-        className="h-full bg-ink transition-all duration-700 ease-out"
+        className="h-full bg-ink transition-all duration-[1600ms] ease-[cubic-bezier(.16,1,.3,1)]"
         style={{ width: `${Math.max(4, value * 100)}%`, opacity: active ? 1 : 0 }}
       />
     </div>
+  );
+}
+
+/** "Working" as the portfolio says it: a 4px dot breathing next to a muted line. */
+function Breathing({ children }) {
+  return (
+    <span className="inline-flex items-center gap-2 text-mute">
+      <span className="breathe inline-block h-1 w-1 rounded-full bg-ink" />
+      {children}
+    </span>
   );
 }
 
@@ -441,74 +349,69 @@ function Browse({ route, cardHandlers }) {
     if (!busy.current && next != null) load(next);
   }, [load, next]);
 
+  const home = route.view === "feed" || route.view === "featured";
   return (
-    <main className="px-4 pb-16 md:px-6">
-      {(route.view === "feed" || route.view === "featured") && (
-        <div className="fade-in mb-5 flex flex-col items-center gap-2">
-          <div className="flex gap-1 rounded-full bg-wash p-1">
-            {[
-              ["feed", "Per te"],
-              ["featured", "In evidenza"],
-            ].map(([view, label]) => (
-              <button
-                key={view}
-                type="button"
-                onClick={() => cardHandlers.onNav(view)}
-                className={`rounded-full px-5 py-2 text-sm font-semibold transition ${
-                  route.view === view ? "bg-white text-ink shadow-sm" : "text-mute hover:text-ink"
-                }`}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          <p className="text-xs text-mute">
-            {route.view === "feed" && !personal
-              ? "Apri e salva qualche immagine: qui nascerà il tuo feed personale."
-              : indexed
-                ? `${indexed.toLocaleString("it-IT")} immagini nel tuo indice · cresce mentre navighi`
-                : "\u00a0"}
-          </p>
-        </div>
-      )}
-      {(route.view === "feed" || route.view === "featured") && (
-        <div className="-mx-4 mb-6 flex gap-2 overflow-x-auto px-4 pb-1 md:mx-0 md:flex-wrap md:justify-center md:px-0">
-          {SUGGESTIONS.map((s, i) => (
-            <button
-              key={s}
-              type="button"
-              onClick={() => cardHandlers.onSearch(s)}
-              className="rise shrink-0 rounded-full bg-wash px-4 py-2 text-sm font-medium transition hover:-translate-y-0.5 hover:bg-ink hover:text-white"
-              style={{ "--i": i }}
-            >
-              {s}
-            </button>
-          ))}
-        </div>
-      )}
-      {route.view === "search" && !loading && (
-        <div className="fade-in mb-6 flex flex-col items-center gap-1 text-center text-sm text-mute">
-          <p>
-            {english && english.toLowerCase() !== route.q.toLowerCase()
-              ? `Risultati per “${route.q}” · cercato come “${english}”`
-              : `Risultati per “${route.q}”`}
-          </p>
-          <p className="h-5 text-xs">
-            {checking ? (
-              <span className="inline-flex items-center gap-1.5">
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-ink" />
-                Controllo che ogni immagine mostri davvero “{english || route.q}”…
-              </span>
-            ) : hidden ? (
-              `${hidden} immagini nascoste: fuori tema o poco belle`
-            ) : null}
-          </p>
-        </div>
-      )}
+    <main className="mx-auto max-w-[1500px] px-6 pt-16 pb-24 md:pt-24">
+      <div className="mx-auto mb-16 flex max-w-[560px] flex-col gap-3.5">
+        {home && (
+          <>
+            <p className="rise rise-1">
+              Ogni immagine è una pagina. Le cose che contiene sono collegamenti: portano a ciò che le spiega, e da lì ad altre
+              immagini.
+            </p>
+            <p className="rise rise-2 flex flex-wrap gap-x-5 gap-y-1">
+              {[
+                ["feed", "Per te"],
+                ["featured", "In evidenza"],
+              ].map(([view, label]) => (
+                <button
+                  key={view}
+                  type="button"
+                  onClick={() => cardHandlers.onNav(view)}
+                  className={`calm transition-colors ${route.view === view ? "text-ink" : "text-mute hover:text-ink"}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </p>
+            <p className="rise rise-3 text-mute">
+              {route.view === "feed" && !personal
+                ? "Apri e salva qualche immagine: qui nascerà il tuo feed."
+                : indexed
+                  ? `${indexed.toLocaleString("it-IT")} immagini nell'indice, che cresce mentre navighi.`
+                  : " "}
+            </p>
+            <p className="rise rise-4 text-mute">
+              Prova con{" "}
+              {SUGGESTIONS.map((s, i) => (
+                <span key={s}>
+                  <button type="button" onClick={() => cardHandlers.onSearch(s)} className="link text-ink-2">
+                    {s}
+                  </button>
+                  {i < SUGGESTIONS.length - 1 ? ", " : "."}
+                </span>
+              ))}
+            </p>
+          </>
+        )}
+        {route.view === "search" && !loading && (
+          <>
+            <p className="rise rise-1">
+              {route.q}
+              {english && english.toLowerCase() !== route.q.toLowerCase() && <span className="text-mute"> · cercato come {english}</span>}
+            </p>
+            <p className="rise rise-2 min-h-[1.6em] text-mute">
+              {checking ? (
+                <Breathing>Controllo che ogni immagine mostri davvero {english || route.q}</Breathing>
+              ) : hidden ? (
+                `${hidden} immagini nascoste: fuori tema o poco belle.`
+              ) : null}
+            </p>
+          </>
+        )}
+        {route.view === "saved" && <p className="rise rise-1">Salvati</p>}
+      </div>
       {route.view === "search" && <ProgressBar value={checking ? 0.6 : 1} active={checking} />}
-      {route.view === "saved" && (
-        <h1 className="fade-in mt-4 mb-8 text-center text-3xl font-semibold tracking-tight">Salvati</h1>
-      )}
 
       {error && <p className="py-20 text-center text-mute">{error}</p>}
       {loading ? (
@@ -517,7 +420,7 @@ function Browse({ route, cardHandlers }) {
         <Masonry items={items} animate={route.view === "search"} onOpen={cardHandlers.onOpen} onSave={cardHandlers.onSave} />
       ) : (
         !error && (
-          <p className="py-24 text-center text-mute">
+          <p className="mx-auto max-w-[560px] text-mute">
             {route.view === "saved" ? "Non hai ancora salvato nessuna immagine." : "Nessun risultato."}
           </p>
         )
@@ -554,25 +457,25 @@ function cropStyle(src, box) {
   };
 }
 
-/** The way here, like a browser history of articles: each image, and the detail that led to the next. */
+/** The way here, like a browser history of articles: each step, and the detail that led to it. */
 function Trail({ trail, current, onOpen }) {
   const path = trail.slice(0, 10).reverse();
   if (path.length < 2) return null;
   return (
-    <nav className="fade-in mx-auto mb-5 flex max-w-6xl items-center gap-1.5 overflow-x-auto pb-1" aria-label="Il tuo percorso">
+    <nav className="fade-in mx-auto mb-14 flex max-w-[560px] items-center gap-2 overflow-x-auto" aria-label="Il tuo percorso">
       {path.map((t, i) => (
-        <span key={t.title} className="flex shrink-0 items-center gap-1.5">
+        <span key={t.title} className="flex shrink-0 items-center gap-2">
           {i > 0 && (
-            <span className="flex items-center gap-1.5 text-mute">
-              <span className="h-px w-3 bg-line" />
+            <span className="flex items-center gap-2">
+              <span className="h-px w-3 bg-rule-2" />
               {t.anchor && (
                 <span
                   title="Il dettaglio che ti ha portato qui"
-                  className="h-7 rounded-md bg-wash ring-1 ring-line"
+                  className="h-5 rounded-[2px] bg-wash"
                   style={{ ...cropStyle(t.anchor.src, t.anchor.box), aspectRatio: `${boxAspect(t.anchor.box, t.anchor.ratio)}` }}
                 />
               )}
-              <span className="h-px w-3 bg-line" />
+              <span className="h-px w-3 bg-rule-2" />
             </span>
           )}
           <button
@@ -580,9 +483,7 @@ function Trail({ trail, current, onOpen }) {
             title={t.name}
             disabled={t.title === current}
             onClick={() => onOpen(t)}
-            className={`h-9 w-9 overflow-hidden rounded-full bg-wash transition ${
-              t.title === current ? "ring-2 ring-ink ring-offset-2" : "opacity-70 hover:-translate-y-0.5 hover:opacity-100"
-            }`}
+            className={`calm h-7 w-7 overflow-hidden rounded-[2px] bg-wash transition-opacity ${t.title === current ? "opacity-100" : "opacity-40 hover:opacity-100"}`}
           >
             <img src={t.thumb} alt={t.name} className="h-full w-full object-cover" />
           </button>
@@ -597,10 +498,10 @@ function bytes(b64) {
 }
 
 /**
- * The image as a page: the things in it (found by DINOv2) are its links. A dot marks each one;
- * hovering lights it up and previews what it is (the Wikipedia concept, once named) and where it
- * leads; clicking dives into it: that part of the image grows into the concept's page (or, without
- * a concept, into the most similar image).
+ * The image as a page: the things in it (found by DINOv2) are its links. A small breathing dot
+ * marks each one; hovering lights it up and previews what it is (the Wikipedia concept, once
+ * named); clicking dives into it: that part of the image grows into the concept's page (or,
+ * without a concept, into the most similar image).
  */
 function PageHero({ origin, page, concepts, hover, setHover, onFollow, onConcept }) {
   const [bigLoaded, setBigLoaded] = useState(false);
@@ -612,7 +513,7 @@ function PageHero({ origin, page, concepts, hover, setHover, onFollow, onConcept
   const links = page?.links || [];
   const map = page?.map;
 
-  // Darken everything but the hovered thing.
+  // Veil everything but the hovered thing.
   useEffect(() => {
     const canvas = shade.current;
     if (!canvas || !map) return;
@@ -620,7 +521,10 @@ function PageHero({ origin, page, concepts, hover, setHover, onFollow, onConcept
     canvas.height = page.h;
     const ctx = canvas.getContext("2d");
     const img = ctx.createImageData(page.w, page.h);
-    for (let i = 0; i < map.length; i += 1) if (map[i] !== hover) img.data[i * 4 + 3] = 140;
+    for (let i = 0; i < map.length; i += 1) {
+      if (map[i] === hover) continue;
+      img.data.set([250, 249, 246, 150], i * 4); // the paper colour, not black: the rest fades back
+    }
     ctx.putImageData(img, 0, 0);
   }, [map, hover, page]);
 
@@ -644,8 +548,8 @@ function PageHero({ origin, page, concepts, hover, setHover, onFollow, onConcept
   const big = bigThumb(origin);
   return (
     <div
-      className="relative mx-auto rounded-3xl bg-wash shadow-[0_30px_60px_-30px_rgba(0,0,0,0.35)]"
-      style={{ aspectRatio: `${ratio}`, width: `min(100%, calc(76vh * ${ratio}))` }}
+      className="relative mx-auto"
+      style={{ aspectRatio: `${ratio}`, width: `min(100%, calc(78vh * ${ratio}))` }}
       onPointerDown={(e) => {
         touch.current = e.pointerType === "touch";
       }}
@@ -658,8 +562,8 @@ function PageHero({ origin, page, concepts, hover, setHover, onFollow, onConcept
         else if (i >= 0) follow(i);
       }}
     >
-      <div className={`absolute inset-0 overflow-hidden rounded-3xl ${hover >= 0 ? "cursor-pointer" : ""}`}>
-        {origin?.thumb ? (
+      <div className={`placeholder absolute inset-0 overflow-hidden rounded-[2px] ${hover >= 0 ? "cursor-pointer" : ""}`}>
+        {origin?.thumb && (
           <>
             {/* The grid thumbnail is already cached: show it at once (it is what the card morphs into). */}
             <img data-hero src={origin.thumb} alt={origin.name} className="h-full w-full object-cover" style={{ viewTransitionName: "hero" }} />
@@ -667,18 +571,16 @@ function PageHero({ origin, page, concepts, hover, setHover, onFollow, onConcept
               src={big}
               alt=""
               onLoad={() => setBigLoaded(true)}
-              className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-700 ${bigLoaded ? "opacity-100" : "opacity-0"}`}
+              className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-[1800ms] ease-[cubic-bezier(.16,1,.3,1)] ${bigLoaded ? "opacity-100" : "opacity-0"}`}
             />
           </>
-        ) : (
-          <div className="shimmer h-full w-full" />
         )}
         <canvas
           ref={shade}
-          className={`pointer-events-none absolute inset-0 h-full w-full transition-opacity duration-300 ${hover >= 0 ? "opacity-100" : "opacity-0"}`}
+          className={`pointer-events-none absolute inset-0 h-full w-full transition-opacity duration-[1200ms] ease-[cubic-bezier(.16,1,.3,1)] ${hover >= 0 ? "opacity-100" : "opacity-0"}`}
         />
         {diving >= 0 && (
-          // The part being followed, drawn over itself: the View Transition grows it into the next image.
+          // The part being followed, drawn over itself: the View Transition grows it into the next page.
           <span ref={dive} className="absolute bg-no-repeat" style={{
             left: `${links[diving].box[0] * 100}%`,
             top: `${links[diving].box[1] * 100}%`,
@@ -690,115 +592,125 @@ function PageHero({ origin, page, concepts, hover, setHover, onFollow, onConcept
         {links.map((l, i) => (
           <span
             key={i}
-            className="rise pointer-events-none absolute -translate-x-1/2 -translate-y-1/2"
-            style={{ left: `${l.dot[0] * 100}%`, top: `${l.dot[1] * 100}%`, "--i": i * 3 }}
+            className="fade-in pointer-events-none absolute -translate-x-1/2 -translate-y-1/2"
+            style={{ left: `${l.dot[0] * 100}%`, top: `${l.dot[1] * 100}%`, animationDelay: `${0.3 + i * 0.25}s` }}
           >
             <span
-              className={`block h-3.5 w-3.5 rounded-full border-2 border-white shadow-[0_0_0_1px_rgba(0,0,0,0.25),0_2px_8px_rgba(0,0,0,0.35)] transition duration-300 ${
-                hover === i ? "scale-150 bg-white" : "bg-white/30 backdrop-blur"
+              className={`block h-1.5 w-1.5 rounded-full bg-paper outline outline-1 outline-ink/25 transition-transform duration-[1200ms] ease-[cubic-bezier(.16,1,.3,1)] ${
+                hover === i ? "scale-[1.8]" : "breathe"
               }`}
+              style={{ animationDelay: `${i * 0.7}s` }}
             />
           </span>
         ))}
       </div>
 
       {shown && (
-        // Where this link leads, like Wikipedia's hover preview.
+        // What this part is, like Wikipedia's hover preview.
         <div
           key={hover}
-          className="fade-in pointer-events-none absolute z-20 w-72 rounded-2xl bg-white p-2 shadow-[0_20px_50px_-12px_rgba(0,0,0,0.45)]"
+          className="fade-in pointer-events-none absolute z-20 w-72 rounded-[2px] border border-rule bg-paper p-3"
           style={{
-            left: shown.dot[0] > 0.55 ? undefined : `calc(${shown.dot[0] * 100}% + 18px)`,
-            right: shown.dot[0] > 0.55 ? `calc(${(1 - shown.dot[0]) * 100}% + 18px)` : undefined,
+            left: shown.dot[0] > 0.55 ? undefined : `calc(${shown.dot[0] * 100}% + 16px)`,
+            right: shown.dot[0] > 0.55 ? `calc(${(1 - shown.dot[0]) * 100}% + 16px)` : undefined,
             top: shown.dot[1] > 0.55 ? undefined : `calc(${shown.dot[1] * 100}% - 12px)`,
             bottom: shown.dot[1] > 0.55 ? `calc(${(1 - shown.dot[1]) * 100}% - 12px)` : undefined,
           }}
         >
-          {idea && (
-            <div className="px-2 pt-1.5 pb-2.5">
-              <p className="text-[15px] leading-snug font-semibold first-letter:uppercase">{idea.name}</p>
-              {idea.extract && <p className="mt-1 line-clamp-4 text-[13px] leading-snug text-mute">{idea.extract}</p>}
+          {idea ? (
+            <div className="mb-3 flex flex-col gap-1">
+              <p className="first-letter:uppercase">{idea.name}</p>
+              {idea.extract && <p className="line-clamp-4 text-ink-2">{idea.extract}</p>}
             </div>
-          )}
-          <div className="grid grid-cols-3 gap-1.5">
-            {shown.items.slice(0, idea ? 3 : 4).map((it, k) => (
-              <img
-                key={it.title}
-                src={it.thumb}
-                alt=""
-                className={`w-full rounded-xl bg-wash object-cover ${!idea && k === 0 ? "col-span-3 aspect-[16/10]" : "aspect-square"}`}
-              />
+          ) : concepts === null ? (
+            <p className="mb-3">
+              <Breathing>Cerco cos'è</Breathing>
+            </p>
+          ) : null}
+          <div className="grid grid-cols-3 gap-2">
+            {shown.items.slice(0, 3).map((it) => (
+              <img key={it.title} src={it.thumb} alt="" className="aspect-[4/5] w-full rounded-[2px] bg-wash object-cover" />
             ))}
           </div>
-          <p className="px-1.5 pt-2 pb-0.5 text-xs text-mute">{idea ? "Clicca per leggere la voce" : "Clicca per entrare"}</p>
+          <p className="mt-2.5 text-mute">{idea ? "Clicca per leggere la voce" : "Clicca per entrare"}</p>
         </div>
       )}
     </div>
   );
 }
 
-/** "In questa immagine": every thread leaving this image, the part on the left, where it goes on the right. */
+/**
+ * "In questa immagine": every thread leaving this image, as list rows. A row shows the part and
+ * what it is; opened, the explanation and where it leads. Hovering a row lights its part above.
+ */
 function Threads({ origin, page, concepts, hover, setHover, onFollow, onConcept }) {
+  const [open, setOpen] = useState(-1);
   const ratio = origin?.width && origin?.height ? origin.width / origin.height : 1;
   if (!page) {
     return (
-      <div className="flex flex-col gap-4">
-        {[0, 1, 2].map((i) => (
-          <div key={i} className="flex gap-3">
-            <div className="shimmer h-28 w-28 shrink-0 rounded-2xl" />
-            <div className="shimmer h-28 flex-1 rounded-2xl" />
-          </div>
-        ))}
-      </div>
+      <p className="border-t border-rule py-[11px]">
+        <Breathing>Guardo cosa c'è nell'immagine</Breathing>
+      </p>
     );
   }
-  if (!page.links.length) return <p className="text-sm text-mute">DINOv2 non ha trovato parti da seguire in questa immagine.</p>;
+  if (!page.links.length) return <p className="border-t border-rule py-[11px] text-mute">Nessuna parte da seguire in questa immagine.</p>;
   const src = bigThumb(origin);
   return (
-    <div className="flex flex-col gap-4">
-      {page.links.map((l, i) => (
-        <div
-          key={i}
-          className={`rise flex gap-3 rounded-3xl p-1.5 transition ${hover === i ? "bg-wash" : ""}`}
-          style={{ "--i": i }}
-          onMouseEnter={() => setHover(i)}
-          onMouseLeave={() => setHover(-1)}
-        >
-          <button
-            type="button"
-            onClick={() => (concepts?.[i] ? onConcept(l, concepts[i], null) : onFollow(l, l.items[0], null))}
-            title="Segui questo dettaglio"
-            className="h-28 max-w-48 shrink-0 rounded-2xl bg-wash bg-no-repeat ring-1 ring-black/5 transition hover:scale-[1.03] md:h-36"
-            style={{ ...cropStyle(src, l.box), aspectRatio: `${Math.min(1.6, Math.max(0.6, boxAspect(l.box, ratio)))}` }}
-          />
-          <div className="flex min-w-0 flex-1 flex-col gap-2">
-          {concepts === null ? (
-            <span className="shimmer h-5 w-40 rounded-full" />
-          ) : concepts?.[i] ? (
-            <button type="button" onClick={() => onConcept(l, concepts[i], null)} className="group/c min-w-0 text-left">
-              <span className="text-[15px] font-semibold first-letter:uppercase group-hover/c:underline">{concepts[i].name}</span>
-              {concepts[i].extract && (
-                <span className="mt-0.5 line-clamp-2 text-sm leading-snug text-mute">{concepts[i].extract}</span>
-              )}
+    <div className="recede flex flex-col">
+      {page.links.map((l, i) => {
+        const c = concepts?.[i];
+        const isOpen = open === i;
+        return (
+          <div
+            key={i}
+            className="rise group border-t border-rule"
+            style={{ "--i": i * 3 }}
+            onMouseEnter={() => setHover(i)}
+            onMouseLeave={() => setHover(-1)}
+          >
+            <button
+              type="button"
+              onClick={() => setOpen(isOpen ? -1 : i)}
+              aria-expanded={isOpen}
+              className="grid w-full grid-cols-[108px_1fr_auto] items-center gap-x-0 py-[11px] text-left"
+            >
+              <span
+                className="h-9 max-w-[84px] rounded-[2px] bg-wash bg-no-repeat"
+                style={{ ...cropStyle(src, l.box), aspectRatio: `${Math.min(2, Math.max(0.6, boxAspect(l.box, ratio)))}` }}
+              />
+              <span className="calm min-w-0 truncate transition-transform group-hover:translate-x-[3px]">
+                {c ? <span className="first-letter:uppercase">{c.name}</span> : concepts === null ? <Breathing>Cerco cos'è</Breathing> : <span className="text-mute">Una parte dell'immagine</span>}
+              </span>
+              <span className="plus ml-4 text-mute" data-open={isOpen} aria-hidden="true" />
             </button>
-          ) : null}
-          <div className="flex min-w-0 flex-1 gap-2 overflow-x-auto">
-            {l.items.map((it) => (
-              <button
-                key={it.title}
-                type="button"
-                title={it.name}
-                onClick={(e) => onFollow(l, it, e.currentTarget.querySelector("img"))}
-                className="h-24 shrink-0 overflow-hidden rounded-2xl bg-wash transition hover:opacity-90 md:h-28"
-                style={{ aspectRatio: it.width && it.height ? `${it.width} / ${it.height}` : "1" }}
-              >
-                <img src={it.thumb} alt={it.name} loading="lazy" className="h-full w-full object-cover" />
-              </button>
-            ))}
+            <div className="fold" data-open={isOpen}>
+              <div>
+                <div className="flex flex-col gap-3.5 pb-6 pl-[108px]">
+                  {c?.extract && <p className="text-ink-2">{c.extract}</p>}
+                  <div className="grid grid-cols-2 gap-2">
+                    {l.items.slice(0, 4).map((it) => (
+                      <button key={it.title} type="button" title={it.name} onClick={(e) => onFollow(l, it, e.currentTarget.querySelector("img"))} className="block">
+                        <img src={it.thumb} alt={it.name} loading="lazy" className="aspect-[4/5] w-full rounded-[2px] bg-wash object-cover" />
+                      </button>
+                    ))}
+                  </div>
+                  <p className="flex gap-5">
+                    {c && (
+                      <button type="button" onClick={() => onConcept(l, c, null)} className="link">
+                        Leggi la voce
+                      </button>
+                    )}
+                    <button type="button" onClick={() => onFollow(l, l.items[0], null)} className="link text-ink-2">
+                      Entra nella prima immagine
+                    </button>
+                  </p>
+                </div>
+              </div>
+            </div>
           </div>
-          </div>
-        </div>
-      ))}
+        );
+      })}
+      <div className="border-t border-rule" />
     </div>
   );
 }
@@ -954,23 +866,16 @@ function Detail({ route, preview, cardHandlers, onBack }) {
   const busy = phase === "loading" || phase === "refining";
   const status =
     phase === "loading"
-      ? "Guardo le immagini collegate…"
+      ? "Guardo le immagini collegate"
       : phase === "refining"
-        ? `Affino · ${analysed} di ${info.candidates} immagini analizzate`
+        ? `Affino: ${analysed} di ${info.candidates} immagini guardate`
         : phase === "error"
           ? error
-          : `${analysed} immagini analizzate${info.pending ? ` · ${info.pending} ancora da guardare` : ""}`;
+          : `${analysed} immagini guardate${info.pending ? `, ${info.pending} ancora da guardare` : ""}. Passa sopra un'immagine: “più” e “meno” riordinano i risultati.`;
 
   return (
-    <main className="relative px-4 pb-16 md:px-6">
+    <main className="mx-auto max-w-[1500px] px-6 pt-12 pb-24 md:pt-20">
       <ProgressBar value={info.candidates ? analysed / info.candidates : 0.08} active={busy} />
-
-      {/* Ambient glow made of the image's own colours */}
-      {origin?.thumb && (
-        <div className="pointer-events-none absolute inset-x-0 -top-[72px] -z-10 h-[90vh] overflow-hidden [mask-image:linear-gradient(to_bottom,black,transparent)]">
-          <img src={origin.thumb} alt="" className="fade-in h-full w-full scale-125 object-cover opacity-30 blur-[90px] saturate-150" />
-        </div>
-      )}
 
       <Trail
         trail={trail}
@@ -978,95 +883,46 @@ function Detail({ route, preview, cardHandlers, onBack }) {
         onOpen={(t) => (t.kind === "concept" ? cardHandlers.onConcept({ qid: t.title, name: t.name, thumb: t.thumb }) : cardHandlers.onOpen(t))}
       />
 
-      <section className="mx-auto mb-14 grid max-w-6xl gap-6 md:mt-2 md:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)] md:gap-10">
-        <div className="relative">
-          <button
-            type="button"
-            onClick={onBack}
-            className="absolute top-3 left-3 z-10 grid h-10 w-10 place-items-center rounded-full bg-white/95 shadow-sm transition hover:scale-105 hover:bg-white"
-            aria-label="Indietro"
-          >
-            {Icon.back}
-          </button>
-          <PageHero
-            origin={origin}
-            page={page}
-            concepts={concepts}
-            hover={hover}
-            setHover={setHover}
-            onFollow={follow}
-            onConcept={openConcept}
-          />
+      <header className="mx-auto mb-14 flex max-w-[560px] flex-col gap-3.5">
+        <div className="rise rise-1 flex flex-col gap-0.5">
+          <h1 className="break-words">{origin?.name || " "}</h1>
+          {origin?.author !== undefined && <p className="text-mute">{[origin.author, origin.license].filter(Boolean).join(" · ")}</p>}
         </div>
-
-        <aside className="flex flex-col gap-6 md:pt-2">
-          <div className="fade-in">
-            <h1 className="text-2xl leading-tight font-semibold tracking-tight break-words md:text-[28px]">
-              {origin?.name || " "}
-            </h1>
-            {origin?.author !== undefined && (
-              <p className="mt-2 text-sm text-mute">{[origin.author, origin.license].filter(Boolean).join(" · ")}</p>
+        <p className="rise rise-2 text-ink-2">
+          Ogni cosa in questa immagine è un collegamento, come le parole di una voce di Wikipedia. Passaci sopra per scoprire cos'è,
+          clicca per leggerne la voce e continuare da lì.
+        </p>
+        {origin && (
+          <p className="rise rise-3 flex flex-wrap gap-x-5 gap-y-1">
+            <button type="button" onClick={onBack} className="link">
+              Indietro
+            </button>
+            <button type="button" onClick={() => cardHandlers.onSave(origin)} className="link">
+              {origin.saved ? "Salvata" : "Salva"}
+            </button>
+            {origin.page_url && (
+              <a href={origin.page_url} target="_blank" rel="noreferrer">
+                {origin.source || "Wikimedia Commons"}
+              </a>
             )}
-          </div>
-
-          {origin && (
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={() => cardHandlers.onSave(origin)}
-                className="rounded-full bg-ink px-5 py-3 text-sm font-semibold text-white transition hover:bg-black active:scale-95"
-              >
-                {origin.saved ? "Salvata" : "Salva"}
-              </button>
-              {origin.page_url && (
-                <a
-                  href={origin.page_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="flex items-center gap-1.5 rounded-full bg-wash px-5 py-3 text-sm font-semibold transition hover:bg-line"
-                >
-                  Apri su {origin.source || "Wikimedia Commons"} {Icon.out}
-                </a>
-              )}
-            </div>
-          )}
-
-          <div className="rounded-2xl border border-line bg-white/70 p-5 backdrop-blur">
-            <div className="mb-3 flex items-baseline justify-between">
-              <span className="text-sm font-semibold">Simili per</span>
-              <span key={lookLabel(weight)} className="fade-in text-sm text-mute">
-                {lookLabel(weight)}
-              </span>
-            </div>
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={weight}
-              onChange={(e) => setWeight(Number(e.target.value))}
-              className="look-range"
-              aria-label="Aspetto o soggetto"
-            />
-            <div className="mt-2 flex justify-between text-xs text-mute">
-              <span>Soggetto</span>
-              <span>Aspetto</span>
-            </div>
-            <p className="mt-4 text-xs leading-relaxed text-mute">
-              Passa sopra un'immagine e usa <b className="text-ink">+</b> per “più così” o <b className="text-ink">−</b> per
-              “meno così”: i risultati si riordinano e l'app impara i tuoi gusti.
-            </p>
-          </div>
-
-          <p className="text-sm leading-relaxed text-mute">
-            Ogni cosa in questa immagine è un collegamento, come le parole di una voce di Wikipedia: passaci sopra per
-            scoprire cos'è, clicca per leggerne la voce e continuare da lì.
           </p>
-        </aside>
+        )}
+      </header>
+
+      <section className="rise rise-3 mb-24">
+        <PageHero
+          origin={origin}
+          page={page}
+          concepts={concepts}
+          hover={hover}
+          setHover={setHover}
+          onFollow={follow}
+          onConcept={openConcept}
+        />
       </section>
 
-      <section className="mx-auto mb-14 max-w-6xl">
-        <h2 className="mb-4 text-xl font-semibold tracking-tight">In questa immagine</h2>
+      <section className="mx-auto mb-24 flex max-w-[560px] flex-col gap-3.5">
+        <p className="text-mute">In questa immagine</p>
         <Threads
           origin={origin}
           page={page}
@@ -1078,16 +934,29 @@ function Detail({ route, preview, cardHandlers, onBack }) {
         />
       </section>
 
-      <div className="mx-auto mb-5 flex max-w-6xl items-center justify-between gap-4">
-        <h2 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
-          Simili
-          {busy && <span className="text-mute">{Icon.spark}</span>}
-        </h2>
-        <span className="flex items-center gap-2 text-right text-xs text-mute">
-          {busy && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-ink" />}
-          {status}
-        </span>
-      </div>
+      <section className="mx-auto mb-10 flex max-w-[560px] flex-col gap-3.5">
+        <p className="text-mute">Simili</p>
+        <div className="flex flex-col gap-2">
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            value={weight}
+            onChange={(e) => setWeight(Number(e.target.value))}
+            className="look-range"
+            aria-label="Aspetto o soggetto"
+          />
+          <div className="flex justify-between text-mute">
+            <span>Soggetto</span>
+            <span key={lookLabel(weight)} className="fade-in text-ink-2">
+              {lookLabel(weight)}
+            </span>
+            <span>Aspetto</span>
+          </div>
+        </div>
+        <p className="text-mute">{busy ? <Breathing>{status}</Breathing> : status}</p>
+      </section>
 
       {phase === "loading" && !items.length ? (
         <SkeletonGrid n={12} />
@@ -1102,14 +971,13 @@ function Detail({ route, preview, cardHandlers, onBack }) {
         />
       ) : (
         phase !== "loading" &&
-        phase !== "error" && <p className="py-16 text-center text-mute">Nessuna immagine simile trovata.</p>
+        phase !== "error" && <p className="mx-auto max-w-[560px] text-mute">Nessuna immagine simile trovata.</p>
       )}
 
       <InfiniteSentinel onVisible={loadMore} active={phase === "ready" && (info.pending > 0 || info.more)} />
       {phase === "refining" && items.length > 0 && (
-        <p className="mt-8 flex items-center justify-center gap-2 text-sm text-mute">
-          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-ink" />
-          Cerco altre immagini simili…
+        <p className="mx-auto mt-10 max-w-[560px]">
+          <Breathing>Cerco altre immagini simili</Breathing>
         </p>
       )}
     </main>
@@ -1177,82 +1045,93 @@ function Voce({ route, preview, cardHandlers }) {
   const cover = data?.image || data?.thumb || items[0]?.thumb;
   const paragraphs = (data?.extract || "").split("\n").filter(Boolean);
   return (
-    <main className="px-4 pb-20 md:px-6">
+    <main className="mx-auto max-w-[1500px] px-6 pt-12 pb-24 md:pt-20">
       <ProgressBar value={0.6} active={loading} />
       <Trail
         trail={trail}
         current={route.qid}
         onOpen={(t) => (t.kind === "concept" ? cardHandlers.onConcept({ qid: t.title, name: t.name, thumb: t.thumb }) : cardHandlers.onOpen(t))}
       />
-      <article className="mx-auto mb-14 grid max-w-6xl gap-8 md:mt-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)] md:gap-12">
-        <div className="overflow-hidden rounded-3xl bg-wash shadow-[0_30px_60px_-30px_rgba(0,0,0,0.35)] md:sticky md:top-24 md:self-start">
+      <article className="mx-auto mb-24 flex max-w-[560px] flex-col gap-3.5">
+        <div className="rise rise-1 flex flex-col gap-0.5">
+          <p className="text-mute">Voce</p>
+          <h1 className="first-letter:uppercase">{data?.name || " "}</h1>
+          {data?.description && <p className="text-mute first-letter:uppercase">{data.description.split(" / ").pop()}</p>}
+        </div>
+        <div className="rise rise-2 my-5 overflow-hidden rounded-[2px]">
           {cover ? (
             <img data-hero src={cover} alt={data?.name || ""} className="max-h-[70vh] w-full object-cover" style={{ viewTransitionName: "hero" }} />
           ) : (
-            <div className="shimmer aspect-[4/3]" style={{ viewTransitionName: "hero" }} />
+            <div className="placeholder aspect-[4/5]" style={{ viewTransitionName: "hero" }} />
           )}
         </div>
-        <div className="fade-in flex flex-col gap-5 md:pt-4">
-          <p className="text-xs font-semibold tracking-[0.18em] text-mute uppercase">Voce</p>
-          <h1 className="text-4xl leading-[1.05] font-semibold tracking-tight first-letter:uppercase md:text-5xl">{data?.name || " "}</h1>
-          {data?.description && <p className="text-[15px] text-mute first-letter:uppercase">{data.description.split(" / ").pop()}</p>}
-          {loading && !paragraphs.length ? (
-            <div className="flex flex-col gap-2">
-              {[0, 1, 2, 3].map((i) => (
-                <span key={i} className="shimmer h-4 rounded-full" style={{ width: `${95 - i * 12}%` }} />
-              ))}
-            </div>
-          ) : (
-            paragraphs.map((t, i) => (
-              <p key={i} className="text-[17px] leading-relaxed text-ink/85">
-                {t}
-              </p>
-            ))
-          )}
-          {error && <p className="text-mute">{error}</p>}
-          {data?.url && (
-            <a
-              href={data.url}
-              target="_blank"
-              rel="noreferrer"
-              className="flex w-fit items-center gap-1.5 rounded-full bg-wash px-5 py-3 text-sm font-semibold transition hover:bg-line"
-            >
-              Leggi tutto su Wikipedia{data.lang === "en" ? " (in inglese)" : ""} {Icon.out}
+        {loading && !paragraphs.length ? (
+          <p>
+            <Breathing>Leggo la voce</Breathing>
+          </p>
+        ) : (
+          paragraphs.map((t, i) => (
+            <p key={i} className="rise rise-3 text-ink-2">
+              {t}
+            </p>
+          ))
+        )}
+        {error && <p className="text-mute">{error}</p>}
+        {data?.url && (
+          <p className="rise rise-4">
+            <a href={data.url} target="_blank" rel="noreferrer">
+              Leggi tutto su Wikipedia{data.lang === "en" ? ", in inglese" : ""}
             </a>
-          )}
-          {data?.related?.length > 0 && (
-            <div className="mt-2">
-              <p className="mb-2.5 text-xs font-semibold tracking-[0.18em] text-mute uppercase">Voci collegate</p>
-              <div className="flex flex-wrap gap-2">
-                {data.related.map((r, i) => (
-                  <button
-                    key={r.qid}
-                    type="button"
-                    onClick={() => cardHandlers.onConcept(r)}
-                    className="rise rounded-full bg-wash px-4 py-2 text-sm font-medium transition first-letter:uppercase hover:-translate-y-0.5 hover:bg-ink hover:text-white"
-                    style={{ "--i": i }}
-                  >
+          </p>
+        )}
+        {data?.related?.length > 0 && (
+          <div className="rise rise-5 mt-10 flex flex-col gap-3.5">
+            <p className="text-mute">Voci collegate</p>
+            <p className="text-ink-2">
+              {data.related.map((r, i) => (
+                <span key={r.qid}>
+                  <button type="button" onClick={() => cardHandlers.onConcept(r)} className="link">
                     {r.name}
                   </button>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
+                  {i < data.related.length - 1 ? ", " : "."}
+                </span>
+              ))}
+            </p>
+          </div>
+        )}
       </article>
 
-      <section className="mx-auto max-w-[1800px]">
-        <h2 className="mb-4 text-xl font-semibold tracking-tight">Immagini</h2>
+      <section>
+        <p className="mx-auto mb-3.5 max-w-[560px] text-mute">Immagini</p>
         {loading && !items.length ? (
           <SkeletonGrid n={12} />
         ) : items.length ? (
           <Masonry items={items} onOpen={cardHandlers.onOpen} onSave={cardHandlers.onSave} />
         ) : (
-          !loading && <p className="py-16 text-center text-mute">Nessuna immagine per questa voce, per ora.</p>
+          !loading && <p className="mx-auto max-w-[560px] text-mute">Nessuna immagine per questa voce, per ora.</p>
         )}
         <InfiniteSentinel onVisible={more} active={!loading && next != null} />
       </section>
     </main>
+  );
+}
+
+/* ------------------------------------------------------------------ footer */
+
+/** A short rule, then the local time with the breathing dot, as on the portfolio. */
+function Footer() {
+  const fmt = () =>
+    new Intl.DateTimeFormat("it-IT", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Rome" }).format(new Date());
+  const [time, setTime] = useState(fmt);
+  useEffect(() => {
+    const t = setInterval(() => setTime(fmt()), 15000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <footer className="mx-auto flex max-w-[560px] flex-col gap-3.5 px-6 pt-10 pb-[100px]">
+      <span className="h-px w-12 bg-rule-2" />
+      <Breathing>{time} a Treviso, Italia</Breathing>
+    </footer>
   );
 }
 
@@ -1362,9 +1241,11 @@ export default function App() {
         <Browse key={`${route.view}:${route.q}`} route={route} cardHandlers={cardHandlers} />
       )}
 
+      <Footer />
+
       <div
-        className={`pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full bg-ink px-5 py-3 text-sm font-medium text-white shadow-lg transition duration-300 ${
-          toast ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
+        className={`pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 border border-rule bg-paper px-4 py-2 text-ink-2 transition-[opacity,filter] duration-[1400ms] ease-[cubic-bezier(.16,1,.3,1)] ${
+          toast ? "opacity-100 blur-0" : "opacity-0 blur-[3px]"
         }`}
         role="status"
         aria-live="polite"
