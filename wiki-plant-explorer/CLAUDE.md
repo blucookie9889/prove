@@ -1,14 +1,16 @@
 # wiki-plant-explorer (Wiki Explorer)
 
-A personal, Pinterest-style explorer over **all of Wikimedia Commons** plus other open collections
+A personal, visual "Wikipedia rabbit hole" over **all of Wikimedia Commons** plus other open collections
 (Cleveland Museum of Art CC0 artworks, iNaturalist CC0/CC BY/CC BY-SA nature photos, and Unsplash /
 Pexels photography when their free API keys are in `.env`), browsed live
 through their public APIs. Click an image to get visually similar ones; "più così / meno così" feedback
 refines the ranking, opened and saved images feed a personal "Per te" home, and a background crawler
 keeps growing a local vector index. No image is ever stored on disk: only vectors.
 
-The aim is a discovery experience, not a Pinterest clone: DINOv2 is used at every level (global look,
-patch textures, composition, parts), and lenses / the "Deriva" walk turn those into ways of wandering.
+The core is the image page: like the words of a Wikipedia article, the things inside an image (found
+by DINOv2) are links. Hover one to see what it is (a Wikipedia concept: a drop on a leaf → "Effetto
+loto"), click to open that concept's page ("voce"): the article's summary, the images that depict it,
+related concepts; every image opens another image page. Image → detail → concept → image → …
 
 ## Architecture
 
@@ -19,18 +21,18 @@ backend/sources.py   other collections (Cleveland, iNaturalist, Unsplash, Pexels
 backend/translator.py  local MarianMT Italian -> English
 .env                 UNSPLASH_ACCESS_KEY / PEXELS_API_KEY (git-ignored; template in .env.example)
 backend/embedder.py  DINOv2 (visual, 768-d) + OpenCLIP ViT-B-32 (semantic, 512-d), batched, L2-normalised;
-                     from the same DINOv2 pass: texture, layout, parts (patch level); on demand a patch map
-backend/main.py      FastAPI: /api/foryou, /api/feed, /api/search, /api/file, /api/similar, /api/lens,
-                     /api/dino, /api/detail, /api/drift, /api/vote, /api/view, /api/saved, /api/health;
-                     background crawler and densifier
+                     `regions`: an image's parts from DINOv2 patch tokens (k-means + connected blobs)
+backend/main.py      FastAPI: /api/foryou, /api/feed, /api/search, /api/file, /api/page, /api/concepts,
+                     /api/concept, /api/similar, /api/vote,
+                     /api/view, /api/saved, /api/health; background crawler
 frontend/            React 19 + Vite 6 + Tailwind 4, white image-first UI; Vite proxies /api to the backend
-qdrant_db/           embedded Qdrant (git-ignored): `commons_vectors` (visual, semantic + item payload) and
-                     `dino_dense` (texture, layout, parts multivector + parts_xy), same point ids
+qdrant_db/           embedded Qdrant: collection `commons_vectors` = vector cache (git-ignored). A `dino_dense`
+                     collection left by a removed experiment may be in there; it is unused
 state/feedback.json  votes, saved images and opened images ("views") (git-ignored)
 state/crawler.json   crawler cursors, done categories, interest categories and queries (git-ignored)
 ```
 
-- UI language is Italian. Routes are URL params: `?q=`, `?file=<title>&q=&lens=`, `?drift=<title>`,
+- UI language is Italian. Routes are URL params: `?q=`, `?file=<title>&q=`, `?c=<Wikidata id>` (a voce),
   `?view=saved`, `?view=featured`.
 - Item titles: Commons keeps `File:...`; other collections use `cma:<id>`, `inat:<observation id>`,
   `unsplash:<id>`, `pexels:<id>`. `resolve(title)` looks any of them up again (index payload first,
@@ -76,6 +78,55 @@ flat snapshots and product shots (`PLAIN`), above ~0.02 = good photos.
 - Similar: + 0.15·beauty and `JUNK` hidden, unless the origin itself is below `PLAIN`.
 - Per te: images below `PLAIN` are dropped.
 
+## Image page (`/api/page`): parts of an image as links
+
+1. The origin is fetched at 1280 px (`large_url`, into memory) and `Embedder.regions` reads it at
+   448 px in its own aspect ratio (up to 32x32 DINOv2 patch tokens). k-means (10) on the last-layer
+   tokens gives kinds of things; the connected blobs of each kind are the things.
+2. `link_regions` keeps blobs between 1.2% and 50% of the image that don't wrap around it (background),
+   and gives each a crop box (padded, at least 18% of each side) and a hotspot on the blob itself.
+   Crops that are flat or black (grey std < 14, mean < 10) are dropped.
+3. Each crop is embedded (DINOv2 + CLIP) like a whole image. Crops that look like the whole image add
+   nothing; two crops alike (DINOv2 > 0.8 or CLIP > 0.92: two eyes, two strips of sky) are one link.
+4. `rank_links`: for each crop, its 200 nearest index images by look and by subject; score =
+   ½ look + ½ subject + beauty − 0.5 · CLIP similarity to the whole origin (`LINK_ESCAPE`: a link
+   leads elsewhere, the door in a painting to doors, not to the same painting). No documents, game
+   textures / swatches (CLIP near "blank" prompts > 0.27), strips (aspect > 3.5), near-duplicates.
+   Links take their 10 targets in order of strength and never share one, so each opens another door.
+5. Response: `linkmap` (link index per patch, 255 = none, base64 bytes) for hover highlighting, and
+   per link its box, hotspot and targets. Pages are cached in memory (32). ~2-4 s the first time.
+
+Frontend (`PageHero`, `Threads`, `Trail` in App.jsx): dots on the links; hover darkens the rest and
+pops a preview of where it leads; click → the crop, drawn over itself, is named `hero` and the View
+Transition grows it into the next image ("dive"). On touch, a first tap previews and a second follows.
+"In questa immagine" lists every link: the crop, then its targets. The trail at the top is the way
+here, with the crop that led to each step (stored in sessionStorage with the step).
+
+## Concepts: what a detail is (`/api/concepts`, `/api/concept`)
+
+`/api/concepts?title=` names each link of a page (same order as its links), from free Wikimedia data
+only, in a few batched requests (Commons answers 429 to bursts; `_get` allows 4 at a time per host):
+1. For every link image: what its structured data says it depicts (P180, `depicts_of`, weight 1.5)
+   and the Wikidata topics of its Commons categories (`categories_of` + `articles`, weight 1), minus
+   archive facets (`ARCHIVE_NAME`: "photographs of", "IUCN", "by color", months…). Images count
+   0.85^rank; what the origin itself depicts / is filed under adds 0.3 to every link.
+2. Kept: items with an Italian or English Wikipedia article that are kinds of things — not category
+   items, not places / people / works (`PLACE_OR_WORK` on descriptions, then one SPARQL query,
+   `individuals`: P31 human, coordinates P625, creator P170, author P50). A town that looks like this
+   one is never this one.
+3. Score = CLIP cosine of the crop with "a photo of <English label>" + 0.015 · votes (≤ 6); each
+   link gets the best concept not already used. Labels fall back to Wikidata's "mul" (taxa).
+4. `summarize`: the article's REST summary (extract, image, url), cached by Wikidata id.
+The frontend shows the dots as soon as `/api/page` answers, then the names (`/api/concepts`, ~5 s).
+
+`/api/concept?qid=&offset=` is a voce: the summary, the Commons files that depict it
+(`haswbstatement:P180=Q…`, 40 per page) plus its Commons category (P373) when few, and "voci
+collegate" = the explainable concepts most often depicted together with it in those files.
+
+Quality depends on how people labelled Commons: good on common things (leaf, Ferris wheel, horizon,
+cliff, armchair), weaker on fine details. A vision-language model could name and explain details
+far better, but would need an API key.
+
 ## Similar images (`/api/similar`)
 
 Nobody publishes visual embeddings for Commons and its built-in `morelike:` is text-only (useless
@@ -95,48 +146,12 @@ visually), so similarity is two-stage, like Pinterest:
    embeds at most `budget` unseen candidates (frontend: 24 first, then up to 3 rounds of 64), so
    answers get better as the page refines. Calls for the same origin are serialised (`origin_lock`).
 3. Score per space = min-max(cosine to query); `final = w*visual + (1-w)*semantic` (default w=0.75).
-   The visual score is 70% global DINOv2 and 30% shared parts (`PARTS_WEIGHT`: chamfer similarity
-   of the k-means regions, weighted by their area), where both images have patch descriptors.
    Query vector = origin + 0.7*mean(più così) - 0.35*mean(meno così) for votes given on this origin
    (Rocchio). With >=2 liked images overall, a small pull (0.12) towards their mean ("taste").
 4. Greedy pick in score order, dropping near-duplicates (DINOv2 cosine > 0.94 to the origin or to an
    already picked image). `match` = raw blended cosine, shown as a % in the UI.
 
 Scrolling the similar list asks for 60 more each time (`limit` grows) and appends, keeping cards in place.
-
-## DINOv2, all of it (`dino_dense`, lenses, dettaglio, deriva)
-
-One DINOv2 pass per image (`Embedder.embed_batch`, 224 px, 16x16 patches) gives, besides the CLS
-`visual` vector:
-- `texture` (1536): mean and std of the layer-7 patch tokens (AdaIN-style statistics): materials,
-  grain, colour patterns, wherever and whatever they are.
-- `layout` (768): layer-7 tokens minus their image mean, pooled on a 4x4 grid, each cell projected to
-  48-d (fixed `RandomState(0)` QR projection — don't change it, stored vectors depend on it): composition.
-- `parts` (≤6 x 768, Qdrant MAX_SIM multivector): spherical k-means of the last-layer tokens, one
-  vector per region; `parts_xy` = each region's centre and area in image coordinates (mapped back
-  through the processor's resize-256 / centre-crop-224).
-Images indexed before these existed are backfilled by `densifier()` (re-fetch thumbs into memory,
-batches of 48, one per second, while the user is idle, cursor `dense_offset` in `state/crawler.json`); `ensure_dense`
-computes them on demand for an origin. Until the backfill is done, lenses fall back on global DINOv2.
-
-Lenses (`/api/lens?kind=`, tabs under the detail image; all ranked over the whole local index, instant):
-- `rime`: visual rhymes, same form and different subject. Pool = 1500 nearest by DINOv2; score =
-  z(form) − 1.5·z(CLIP similarity), form mixing global, layout and texture; the bottom quarter by
-  DINOv2 is excluded. Calibrated on contact sheets: shells → hermit crabs, a shell-shaped dish.
-- `materia`: texture vector. `forma`: layout vector. Beauty and near-duplicate rules as in similar.
-- `dettaglio` (`/api/detail?x=&y=`): `/api/dino` computes the origin's patch map at 448 px in its own
-  aspect ratio (`Embedder.patch_map`, cached for 8 images): tokens, PCA→RGB colours (the "Occhi di
-  DINO" overlay) and k-means segments (hover highlight). A click takes the patches of the clicked
-  segment within `DETAIL_RADIUS`, averages them and searches `parts` with MaxSim; each result gets
-  `focus` (its best-matching region), drawn as a spotlight on the card.
-
-Deriva (`/api/drift`, view `?drift=`): a walk through the index, `steps` at a time, state kept
-server-side per `walk` id. Each step draws a link type (`forma`, `materia`, `sguardo` = global DINOv2,
-`senso` = CLIP, `rima`), never the same twice in a row, takes that space's neighbours, adds momentum
-along the previous step's direction, beauty, and an absolute novelty penalty (CLIP similarity to the
-last 5 steps), then samples among the best 6 (softmax, T=0.06): no two walks are alike. `rima` in a
-walk queries the residual look (current DINOv2 vector − 0.8·mean of the last steps), which is what
-lets it leave huge series (thousands of shells on black) instead of circling in them.
 
 ## Background crawler
 

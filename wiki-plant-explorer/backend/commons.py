@@ -13,6 +13,7 @@ import re
 import time
 from html import unescape
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 from PIL import Image
@@ -22,6 +23,7 @@ log = logging.getLogger("commons")
 USER_AGENT = "WikiPlantExplorer/1.0 (https://github.com/blucookie9889/prove; educational demo)"
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
+WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
 THUMB_WIDTH = 500
 FEED_CATEGORY = "Category:Featured pictures on Wikimedia Commons"
 CACHE_TTL_S = 15 * 60
@@ -80,6 +82,7 @@ class Commons:
         # Per image host: Wikimedia answers 429 above a few parallel fetches; other hosts get their own.
         self.image_sems: dict = {}
         self._cache: dict = {}  # metadata responses only, kept CACHE_TTL_S; never images
+        self.api_sems: dict = {}  # per API host: Wikimedia answers 429 to bursts of requests
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -100,10 +103,12 @@ class Commons:
             return hit[1]
         if _budget is not None:
             _budget.take(_background)
-        resp = await self.http.get(url, params=params, headers=_headers)
-        if resp.status_code == 429:  # back off once, politely
-            await asyncio.sleep(min(float(resp.headers.get("retry-after") or 2), 5))
+        sem = self.api_sems.setdefault(httpx.URL(url).host, asyncio.Semaphore(4))
+        async with sem:
             resp = await self.http.get(url, params=params, headers=_headers)
+            if resp.status_code == 429:  # back off once, politely
+                await asyncio.sleep(min(float(resp.headers.get("retry-after") or 2), 5))
+                resp = await self.http.get(url, params=params, headers=_headers)
         resp.raise_for_status()
         data = resp.json()
         if len(self._cache) > 5000:
@@ -256,6 +261,170 @@ class Commons:
         pages = data["query"]["pages"]
         cats = [c["title"] for c in pages[0].get("categories", [])] if pages else []
         return [c for c in cats if not _NOISE_CATEGORY.search(c)]
+
+    async def categories_of(self, titles: list[str]) -> dict[str, list[str]]:
+        """Visible, content-describing categories of many files at once (no sizes, unlike ``categories``)."""
+        out: dict[str, list[str]] = {t: [] for t in titles}
+
+        async def batch(chunk: list[str]) -> None:
+            params = dict(action="query", titles="|".join(chunk), prop="categories", clshow="!hidden", cllimit="max")
+            for _ in range(5):  # cllimit counts across all pages: follow the continuation
+                data = await self._get(COMMONS_API, **params)
+                for page in (data.get("query") or {}).get("pages") or []:
+                    out.setdefault(page["title"], []).extend(
+                        c["title"] for c in page.get("categories", []) if not _NOISE_CATEGORY.search(c["title"]))
+                cont = data.get("continue")
+                if not cont:
+                    break
+                params.update(cont)
+
+        await asyncio.gather(*(batch(titles[i : i + 50]) for i in range(0, len(titles), 50)))
+        return out
+
+    async def subcategories(self, category: str, limit: int = 20) -> list[str]:
+        data = await self._get(COMMONS_API, action="query", list="categorymembers", cmtitle=category,
+                               cmtype="subcat", cmlimit=limit)
+        cats = [c["title"] for c in (data.get("query") or {}).get("categorymembers", [])]
+        return [c for c in cats if not _NOISE_CATEGORY.search(c)]
+
+    async def article(self, category: str) -> dict:
+        """The encyclopedia article about what a Commons category shows: {name, qid, lang, title}.
+
+        A category is linked to a Wikidata item, either the topic itself or a "Wikimedia category"
+        item pointing to it (P301, category's main topic). The topic's Italian Wikipedia article is
+        preferred, then the English one. Only {name} when there is none.
+        """
+        return {"name": category.removeprefix("Category:"), **(await self.articles([category]))[category]}
+
+    async def articles(self, categories: list[str]) -> dict[str, dict]:
+        """``article`` for many categories in a few batched requests: {category: {name, qid, lang,
+        title}}; categories without an article map to {}."""
+        out: dict[str, dict] = {c: {} for c in categories}
+        qid_of: dict[str, str] = {}
+        pages = await asyncio.gather(*(
+            self._get(COMMONS_API, action="query", titles="|".join(categories[i : i + 50]), prop="pageprops",
+                      ppprop="wikibase_item") for i in range(0, len(categories), 50)))
+        for data in pages:
+            for page in (data.get("query") or {}).get("pages") or []:
+                q = (page.get("pageprops") or {}).get("wikibase_item")
+                if q:
+                    qid_of[page["title"]] = q
+        ents = await self._entities(list(set(qid_of.values())), "sitelinks|labels|descriptions")
+        # Items that are themselves categories point to their topic (P301): one more batch.
+        cat_items = [q for q, e in ents.items() if self._is_category_item(e)]
+        topic: dict[str, str] = {}
+        for q, e in (await self._entities(cat_items, "claims")).items():
+            for c in (e.get("claims") or {}).get("P301", []):
+                t = (((c.get("mainsnak") or {}).get("datavalue") or {}).get("value") or {}).get("id")
+                if t:
+                    topic[q] = t
+                    break
+        topics = await self._entities(list(set(topic.values())), "sitelinks|labels|descriptions")
+        for cat, q in qid_of.items():
+            e = topics.get(topic[q]) if q in topic else ents.get(q)
+            if not e or self._is_category_item(e):
+                continue
+            links = e.get("sitelinks") or {}
+            for lang in ("it", "en"):
+                if f"{lang}wiki" in links:
+                    labels, descs = e.get("labels") or {}, e.get("descriptions") or {}
+                    out[cat] = {"qid": e.get("id"), "lang": lang, "title": links[f"{lang}wiki"]["title"],
+                                "name": (labels.get("it") or labels.get("en") or {}).get("value") or links[f"{lang}wiki"]["title"],
+                                "description": " / ".join(d["value"] for d in (descs.get("en"), descs.get("it")) if d)}
+                    break
+        return out
+
+    async def _entities(self, ids: list[str], props: str) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for data in await asyncio.gather(*(
+                self._get(WIKIDATA_API, action="wbgetentities", ids="|".join(ids[i : i + 50]), props=props,
+                          languages="it|en|mul")
+                for i in range(0, len(ids), 50))):
+            out.update({k: v for k, v in (data.get("entities") or {}).items() if "missing" not in v})
+        return out
+
+    @staticmethod
+    def _is_category_item(e: dict) -> bool:
+        """A "Wikimedia category" item: its Wikipedia links (if any) are category pages, not articles."""
+        if "claims" in e:
+            return any((((c.get("mainsnak") or {}).get("datavalue") or {}).get("value") or {}).get("id") == "Q4167836"
+                       for c in e["claims"].get("P31", []))
+        labels = e.get("labels") or {}
+        if re.match(r"^(Category|Categoria):", (labels.get("en") or labels.get("it") or {}).get("value", "")):
+            return True
+        links = e.get("sitelinks") or {}
+        for site in ("itwiki", "enwiki"):
+            if site in links:
+                return bool(re.match(r"^(Category|Categoria):", links[site]["title"]))
+        return True  # no Italian or English article: nothing to read, look for its topic instead
+
+    async def depicts_of(self, titles: list[str]) -> dict[str, list[str]]:
+        """Wikidata ids each file "depicts" (P180 in its structured data), for many files at once."""
+        mid_of: dict[str, str] = {}
+        for data in await asyncio.gather(*(
+                self._get(COMMONS_API, action="query", titles="|".join(titles[i : i + 50]), prop="info")
+                for i in range(0, len(titles), 50))):
+            for page in (data.get("query") or {}).get("pages") or []:
+                if "pageid" in page:
+                    mid_of[f"M{page['pageid']}"] = page["title"]
+        out: dict[str, list[str]] = {t: [] for t in titles}
+        mids = list(mid_of)
+        for data in await asyncio.gather(*(
+                self._get(COMMONS_API, action="wbgetentities", ids="|".join(mids[i : i + 50]), props="claims")
+                for i in range(0, len(mids), 50))):
+            for mid, e in (data.get("entities") or {}).items():
+                st = e.get("statements") or e.get("claims") or {}
+                if isinstance(st, dict) and mid in mid_of:
+                    out[mid_of[mid]] = [q for q in (
+                        (((s.get("mainsnak") or {}).get("datavalue") or {}).get("value") or {}).get("id")
+                        for s in st.get("P180", [])) if q]
+        return out
+
+    async def concepts(self, qids: list[str], claims: bool = False) -> dict[str, dict]:
+        """{qid: {name (Italian, else English), en (English label), description, lang, title (the
+        Wikipedia article, Italian first), category (its Commons category, with ``claims``)}}."""
+        props = "sitelinks|labels|descriptions" + ("|claims" if claims else "")
+        out = {}
+        for q, e in (await self._entities(qids, props)).items():
+            labels, descs, links = e.get("labels") or {}, e.get("descriptions") or {}, e.get("sitelinks") or {}
+            label = labels.get("it") or labels.get("en") or labels.get("mul")  # "mul": scientific names
+            c = {"qid": q, "name": (label or {}).get("value") or q,
+                 "en": (labels.get("en") or labels.get("mul") or labels.get("it") or {}).get("value") or "",
+                 "description": " / ".join(d["value"] for d in (descs.get("en"), descs.get("it")) if d),
+                 "category_item": self._is_category_item({k: v for k, v in e.items() if k != "claims"})}
+            for lang in ("it", "en"):
+                if f"{lang}wiki" in links:
+                    c["lang"], c["title"] = lang, links[f"{lang}wiki"]["title"]
+                    break
+            if claims:
+                for s in (e.get("claims") or {}).get("P373", []):
+                    v = ((s.get("mainsnak") or {}).get("datavalue") or {}).get("value")
+                    if v:
+                        c["category"] = f"Category:{v}"
+                        break
+            out[q] = c
+        return out
+
+    async def individuals(self, qids: list[str]) -> set[str]:
+        """The ids that are one particular thing rather than a kind of thing: people (P31 human),
+        anything with coordinates (places, buildings, monuments) and works with a creator or author."""
+        if not qids:
+            return set()
+        values = " ".join(f"wd:{q}" for q in qids)
+        query = (f"SELECT DISTINCT ?i WHERE {{ VALUES ?i {{ {values} }} "
+                 "{ ?i wdt:P31 wd:Q5 } UNION { ?i wdt:P625 [] } UNION { ?i wdt:P170 [] } UNION { ?i wdt:P50 [] } }")
+        data = await self._get(WIKIDATA_SPARQL, query=query, format="json")
+        return {b["i"]["value"].rsplit("/", 1)[-1] for b in (data.get("results") or {}).get("bindings", [])}
+
+    async def summary(self, lang: str, title: str) -> dict:
+        """Wikipedia's page summary: {extract, thumbnail, url}."""
+        path = quote(title.replace(" ", "_"), safe="")
+        data = await self._get(f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{path}")
+        return {
+            "extract": data.get("extract") or "",
+            "image": (data.get("originalimage") or data.get("thumbnail") or {}).get("source"),
+            "url": ((data.get("content_urls") or {}).get("desktop") or {}).get("page"),
+        }
 
     async def depicts(self, title: str) -> list[str]:
         """Wikidata ids from the file's structured data "depicts" (P180) statements."""

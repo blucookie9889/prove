@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import uuid
 from collections import OrderedDict
@@ -31,7 +32,7 @@ from qdrant_client import QdrantClient, models
 from .commons import Commons
 from .sources import Cleveland, INaturalist, Pexels, RateLimited, Unsplash
 from .translator import Translator
-from .embedder import LAYOUT_DIM, SEMANTIC_DIM, TEXTURE_DIM, VISUAL_DIM, Embedder
+from .embedder import SEMANTIC_DIM, VISUAL_DIM, Embedder
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "qdrant_db"
@@ -40,8 +41,6 @@ CRAWL_PATH = ROOT / "state" / "crawler.json"
 ENV_PATH = ROOT / ".env"  # API keys (git-ignored); see .env.example
 COLLECTION = "commons_vectors"
 SPACES = ("visual", "semantic")
-# DINOv2's patch-level descriptors (see embedder.py), same point ids: texture, layout, parts.
-DENSE = "dino_dense"
 
 # How many not-yet-seen images one /api/similar call may download and embed. The rest are
 # embedded by later calls ("Altri simili"), so the first answer comes back in a few seconds.
@@ -97,39 +96,57 @@ BROAD_POOLS = [
 # "Per te" home feed: neighbours of what the user saved, liked and opened, most recent first.
 FOR_YOU_SEEDS = 30
 FOR_YOU_PAGE = 40
-# Patch-level DINOv2 descriptors for images indexed before they existed: re-fetched and computed
-# while the user is idle, DENSE_BATCH every DENSE_PAUSE_S seconds.
-DENSE_BATCH = 48
-DENSE_PAUSE_S = 1
-# "Similar": share of the DINOv2 score given to shared parts (chamfer similarity of the k-means
-# regions: both images contain the same kinds of things, wherever they are).
-PARTS_WEIGHT = 0.3
-# Lenses: other ways to be alike, each searched in the whole index (see /api/lens).
-LENS_POOL = 400
-# Rime: among the RHYME_POOL nearest images by DINOv2, z(form) - RHYME_SEMANTIC * z(meaning). The pool
-# must be wide: the closest few hundred are nearly always the same subject (all shells on black).
-RHYME_POOL = 1500
-RHYME_SEMANTIC = 1.5
-RHYME_FLOOR = 0.25  # ...among the pool's images at least this far up by DINOv2 similarity (quantile)
-# "Dettaglio": the patches picked around a click (same DINOv2 region, within this share of the grid).
-DETAIL_RADIUS = 0.14
-MAPS_CACHED = 8
-# "Deriva": a walk through the index, one link at a time. Each link is one way to be alike; the
-# next image is drawn among the DRIFT_TOP best (softmax at DRIFT_TEMPERATURE), so no two walks
-# are the same, with momentum along the direction of the last step so it keeps going somewhere.
-DRIFT_LINKS = {"forma": 1.0, "materia": 1.0, "sguardo": 0.8, "senso": 0.7, "rima": 1.2}
-DRIFT_POOL = 80
-DRIFT_TOP = 6
-DRIFT_TEMPERATURE = 0.06
-DRIFT_MOMENTUM = 0.12
-DRIFT_RECENT = 12
-# Novelty: minus this times the closest CLIP similarity to the last DRIFT_NOVELTY_STEPS images, so
-# the walk leaves a subject instead of circling inside one big series (thousands of shells on black).
-DRIFT_NOVELTY = 1.0
-DRIFT_NOVELTY_STEPS = 5
-# A rhyme in a walk looks for the current image's look minus what the last steps have in common
-# (DINOv2 vector - DRIFT_RESIDUAL * their mean): the theme is taken out, the specific form stays.
-DRIFT_RESIDUAL = 0.8
+# Image page: like the words of a Wikipedia article, the things in an image are links. DINOv2 splits
+# it into blobs (see Embedder.regions); each blob is cropped, embedded, and searched in the index.
+LINK_MIN_AREA = 0.012  # smaller blobs are noise
+LINK_MAX_AREA = 0.5  # larger ones are the background or the whole picture
+LINK_PAD = 0.12  # crop = blob's box grown by this share of its size...
+LINK_MIN_SIDE = 0.18  # ...and at least this share of the image's sides, for some context
+LINK_SAME_THING = 0.8  # two blobs whose crops are this alike (DINOv2) are one link (two eyes)...
+LINK_SAME_SUBJECT = 0.92  # ...or this alike for CLIP (two strips of the same sky)
+LINK_MIN_CONTRAST = 14  # crops flatter than this (std of grey levels, 0-255) are shadow or blank wall
+LINK_MIN_LIGHT = 10  # ...or darker than this mean grey level (night scenes with lights are fine)
+LINK_WHOLE = 0.85  # a crop this alike to the whole image adds nothing: no link
+MAX_LINKS = 7
+LINK_POOL = 200  # index neighbours of each crop, by look and by subject
+LINK_TARGETS = 10
+# A link must lead somewhere else: minus this times the CLIP similarity to the whole origin, so the
+# door in a painting leads to doors, not to more of the same painting.
+LINK_ESCAPE = 0.5
+PAGES_CACHED = 32
+# Link targets must be pictures: no game textures or swatches (CLIP close to "blank" prompts; 99.9%
+# of the index is below 0.26), no strips (scrolls 900 x 12 px are unreadable as a thumbnail).
+BLANK_PROMPTS = ["a solid color image", "a blank empty image", "a plain black rectangle", "a uniform flat colour background"]
+BLANK = 0.27
+MAX_ASPECT = 3.5
+# Concepts: what a link is about, as an encyclopedia article (a Wikidata item with a Wikipedia page).
+# Candidates come from the link's images: what their structured data says they "depict" (P180:
+# "water drop", "leaf", "Ferris wheel") and the topics of the Commons categories people filed them in.
+# CLIP picks the one that best names the crop: cosine of the crop with "a photo of <English label>",
+# plus CONCEPT_CONSENSUS per (rank-weighted) image that names it.
+CONCEPT_CONSENSUS = 0.015
+CONCEPT_DEPICTS = 1.5  # a "depicts" statement names the thing itself: it counts more than a category
+CONCEPT_OWN = 0.3  # what the origin itself depicts or is filed under also counts, a little
+CONCEPT_PAGE = 40
+CONCEPTS_CACHED = 2000
+# Categories about the archive rather than the world: how it was photographed, its status, its facets.
+ARCHIVE_NAME = re.compile(
+    r"photograph|photography|images\b|pictures\b|aspect\b|focus stack|iucn|least concern|species\b|"
+    r"\bby (colou?r|taxon|country|year|month|period|location|name|shape|condition)\b|textures? from|"
+    r"january|february|march|april|may\b|june|july|august|september|october|november|december|hemisphere|"
+    r"national (birds|animals|flowers|symbols)|with (left|right) hand|unidentified|in culture\b|"
+    r"\b(sitting|standing|facing|looking)\b|\bviews?\b|\bdetails?\b|collections? of|museum", re.IGNORECASE)
+# A place, a person or a work found by look is nearly always another one: a town that looks like this
+# one, not this one. Recognised by its Wikidata description, and left out.
+PLACE_OR_WORK = re.compile(
+    r"\b(comune|city|town|village|neighbo|district|quartiere|frazione|località|municipality|county|province|"
+    r"provincia|region\b|regione|island (in|of)|isola (di|del)|mountain (in|range)|monte|peak in|river in|"
+    r"fiume|lake in|lago|capital|country in|stato|building in|church in|chiesa|castle in|street in|piazza|"
+    r"square in|national park|parco nazionale|painting by|dipinto|painter|pittore|artist|architect|"
+    r"politician|actor|singer|surname|cognome|given name|human settlement|dam in|bridge in|stadium in|"
+    r"video game|film\b|album|company|brand)", re.IGNORECASE)
+CONCEPT_PAGE = 40
+CONCEPTS_CACHED = 2000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -155,27 +172,15 @@ async def lifespan(_: FastAPI):
                 "semantic": models.VectorParams(size=SEMANTIC_DIM, distance=models.Distance.COSINE),
             },
         )
-    if not client.collection_exists(DENSE):
-        client.create_collection(
-            DENSE,
-            vectors_config={
-                "texture": models.VectorParams(size=TEXTURE_DIM, distance=models.Distance.COSINE),
-                "layout": models.VectorParams(size=LAYOUT_DIM, distance=models.Distance.COSINE),
-                "parts": models.VectorParams(
-                    size=VISUAL_DIM, distance=models.Distance.COSINE,
-                    multivector_config=models.MultiVectorConfig(comparator=models.MultiVectorComparator.MAX_SIM),
-                ),
-            },
-        )
     S["qdrant"] = client
     S["embed_lock"] = asyncio.Lock()
     S["feedback"] = load_feedback()
     S["user_active"] = 0.0
     S["crawl"] = load_crawl_state()
-    tasks = [asyncio.create_task(crawler()), asyncio.create_task(densifier())] if CRAWL else []
+    crawler_task = asyncio.create_task(crawler()) if CRAWL else None
     yield
-    for task in tasks:
-        task.cancel()
+    if crawler_task:
+        crawler_task.cancel()
     await S["commons"].close()
     client.close()
 
@@ -265,66 +270,27 @@ async def ensure_vectors(items: list[dict], new_budget: int = NEW_PER_CALL, back
     if not todo:
         return vecs, pending
 
-    new, failed, late = await embed_items(todo)
-    vecs.update(new)
-    pending += late
-    if new:
-        log.info("embedded %d new images (%d failed, %d pending)", len(new), failed, pending)
-    return vecs, pending
-
-
-async def embed_items(items: list[dict]) -> tuple[dict, int, int]:
-    """Fetch the thumbnails of ``items`` into memory, embed them and store every vector (both
-    collections). Returns ({title: {space: vector}}, failed, timed out)."""
     commons: Commons = S["commons"]
-    tasks = {asyncio.create_task(commons.fetch_image(it["thumb"])): it for it in items}
+    tasks = {asyncio.create_task(commons.fetch_image(it["thumb"])): it for it in todo}
     done, late = await asyncio.wait(tasks, timeout=FETCH_TIMEOUT_S)
     for t in late:
         t.cancel()
+    pending += len(late)
     ok = [(tasks[t], t.result()) for t in done if not t.exception()]
-    vecs: dict[str, dict] = {}
     if not ok:
-        return vecs, len(done), len(late)
+        return vecs, pending
 
-    client: QdrantClient = S["qdrant"]
     async with S["embed_lock"]:
-        points, dense_points = [], []
+        points = []
         for start in range(0, len(ok), 16):
             batch = ok[start : start + 16]
-            visual, semantic, dense = await asyncio.to_thread(S["embedder"].embed_batch, [im for _, im in batch])
-            for (it, _), v, s, d in zip(batch, visual, semantic, dense):
+            visual, semantic = await asyncio.to_thread(S["embedder"].embed_batch, [im for _, im in batch])
+            for (it, _), v, s in zip(batch, visual, semantic):
                 vecs[it["title"]] = {"visual": np.asarray(v, dtype=np.float32), "semantic": np.asarray(s, dtype=np.float32)}
-                pid = point_id(it["title"])
-                points.append(models.PointStruct(id=pid, vector={"visual": v, "semantic": s}, payload=clean(it)))
-                dense_points.append(models.PointStruct(
-                    id=pid, vector={"texture": d["texture"], "layout": d["layout"], "parts": d["parts"]},
-                    payload={"title": it["title"], "parts_xy": d["parts_xy"]},
-                ))
+                points.append(models.PointStruct(id=point_id(it["title"]), vector={"visual": v, "semantic": s}, payload=clean(it)))
         client.upsert(COLLECTION, points=points)
-        client.upsert(DENSE, points=dense_points)
-    return vecs, len(done) - len(ok), len(late)
-
-
-def dense_vectors(titles: list[str], parts: bool = True) -> dict[str, dict]:
-    """{title: {"texture", "layout"[, "parts", "parts_xy"]}} for the titles that have them."""
-    names = ["texture", "layout"] + (["parts"] if parts else [])
-    out = {}
-    for start in range(0, len(titles), 256):
-        ids = [point_id(t) for t in titles[start : start + 256]]
-        for p in S["qdrant"].retrieve(DENSE, ids=ids, with_vectors=names, with_payload=True):
-            d = {k: np.asarray(p.vector[k], dtype=np.float32) for k in names}
-            d["parts_xy"] = p.payload.get("parts_xy") or []
-            out[p.payload["title"]] = d
-    return out
-
-
-async def ensure_dense(item: dict) -> Optional[dict]:
-    """Dense vectors of one image (the origin of a lens), computed now if it was indexed before them."""
-    have = dense_vectors([item["title"]])
-    if item["title"] not in have:
-        await embed_items([item])
-        have = dense_vectors([item["title"]])
-    return have.get(item["title"])
+    log.info("embedded %d new images (%d failed, %d pending)", len(ok), len(todo) - len(ok) - len(late), pending)
+    return vecs, pending
 
 
 def minmax(x: np.ndarray) -> np.ndarray:
@@ -477,50 +443,12 @@ async def crawler() -> None:
             log.warning("crawler %s: %s", key, exc)
 
 
-async def densifier() -> None:
-    """Give the images indexed before the patch-level descriptors existed their texture, layout and
-    parts: walk the index in id order, re-fetch the thumbnails that lack them (into memory only)."""
-    client: QdrantClient = S["qdrant"]
-    st = S["crawl"]
-    queue: list[dict] = []
-    after_queue, last_page = st.get("dense_offset"), False
-    while not st.get("dense_done"):
-        await asyncio.sleep(DENSE_PAUSE_S)
-        if time.time() - S["user_active"] < USER_QUIET_S:
-            continue
-        try:
-            if not queue:
-                # The cursor moves past a page only once all of it is done, so a restart redoes at most one page.
-                if last_page:
-                    st["dense_done"] = True
-                    save_crawl_state()
-                    log.info("densifier: every indexed image has patch descriptors")
-                    break
-                st["dense_offset"] = after_queue
-                pts, after_queue = client.scroll(COLLECTION, limit=256, offset=st["dense_offset"], with_payload=True)
-                last_page = after_queue is None
-                have = {p.id for p in client.retrieve(DENSE, ids=[p.id for p in pts])}
-                queue = [clean(p.payload) for p in pts if p.id not in have]
-                save_crawl_state()
-                continue
-            batch, queue = queue[:DENSE_BATCH], queue[DENSE_BATCH:]
-            await embed_items(batch)
-            if random.random() < 0.05:
-                log.info("densifier: %d of %d images have patch descriptors", client.count(DENSE).count, client.count(COLLECTION).count)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - a bad batch must not stop the backfill
-            log.warning("densifier: %s", exc)
-
-
 # --------------------------------------------------------------------------- routes
 
 
 @app.get("/api/health")
 async def health():
-    client: QdrantClient = S["qdrant"]
-    return {"status": "ok", "indexed": client.count(COLLECTION).count, "dense": client.count(DENSE).count,
-            "saved": len(saved_items()), "crawling": CRAWL}
+    return {"status": "ok", "indexed": S["qdrant"].count(COLLECTION).count, "saved": len(saved_items()), "crawling": CRAWL}
 
 
 def with_saved_flag(items: list[dict]) -> list[dict]:
@@ -787,7 +715,6 @@ async def _similar(title: str, weight: float, q: Optional[str], limit: int, budg
     vecs, _ = await ensure_vectors([origin], new_budget=1)
     if title not in vecs:
         raise HTTPException(502, "Wikimedia non ha risposto per questa immagine, riprova tra poco")
-    await ensure_dense(origin)
 
     local = votes(origin=title)
     more = [t for t, v in local.items() if v == 1]
@@ -815,7 +742,6 @@ async def _similar(title: str, weight: float, q: Optional[str], limit: int, budg
 
     final = np.zeros(len(ranked), dtype=np.float32)
     raw = {}
-    shared = await asyncio.to_thread(parts_similarity, title, [c["title"] for c in ranked])
     for space, w in (("visual", weight), ("semantic", 1.0 - weight)):
         query = vecs[title][space].copy()
         if more_v := [vecs[t][space] for t in more if t in vecs]:
@@ -826,12 +752,6 @@ async def _similar(title: str, weight: float, q: Optional[str], limit: int, budg
         sims = matrix @ unit(query)
         raw[space] = sims
         score = minmax(sims)
-        known = ~np.isnan(shared)
-        if space == "visual" and known.sum() >= 2:
-            # DINOv2 twice: the global look, and the parts both images are made of.
-            parts = score.copy()
-            parts[known] = minmax(shared[known])
-            score = (1 - PARTS_WEIGHT) * score + PARTS_WEIGHT * parts
         if len(liked_all) >= 2:
             taste = unit(np.mean([vecs[t][space] for t in liked_all], axis=0))
             score = score + TASTE * minmax(matrix @ taste)
@@ -873,34 +793,17 @@ async def _similar(title: str, weight: float, q: Optional[str], limit: int, budg
     return {"origin": with_saved_flag([origin])[0], "items": items, "pending": pending, "candidates": len(cands)}
 
 
-def chamfer(a: np.ndarray, a_xy: list, b: np.ndarray, b_xy: list) -> float:
-    """How much two images are made of the same things: each region's best match in the other image,
-    averaged both ways and weighted by the regions' share of the image."""
-    s = a @ b.T
-    wa = np.asarray([r[2] for r in a_xy] or [1.0] * len(a), dtype=np.float32)
-    wb = np.asarray([r[2] for r in b_xy] or [1.0] * len(b), dtype=np.float32)
-    return 0.5 * (float(s.max(1) @ wa) / float(wa.sum()) + float(s.max(0) @ wb) / float(wb.sum()))
-
-
-def parts_similarity(origin: str, titles: list[str]) -> np.ndarray:
-    """Chamfer similarity of ``origin``'s parts to each title's (NaN where descriptors are missing)."""
-    dense = dense_vectors([origin] + titles)
-    out = np.full(len(titles), np.nan, dtype=np.float32)
-    if origin not in dense:
-        return out
-    o = dense[origin]
-    for i, t in enumerate(titles):
-        if t in dense:
-            out[i] = chamfer(o["parts"], o["parts_xy"], dense[t]["parts"], dense[t]["parts_xy"])
-    return out
-
-
-def zscore(x: np.ndarray) -> np.ndarray:
-    return (x - x.mean()) / (x.std() + 1e-6)
+def large_url(item: dict) -> str:
+    """A bigger version of the image for cropping its parts (Commons serves 1280 px thumbnails)."""
+    if "upload.wikimedia.org" in item["thumb"]:
+        if item.get("full_width") and item["full_width"] <= 1280:
+            return item["full"]
+        return re.sub(r"/\d+px-", "/1280px-", item["thumb"])
+    return item["thumb"]
 
 
 def main_vectors(ids: list[str]) -> dict[str, tuple[dict, dict]]:
-    """{point id: (item, {space: vector})} from the main collection."""
+    """{point id: (item, {space: vector})} from the index."""
     out = {}
     for start in range(0, len(ids), 256):
         for p in S["qdrant"].retrieve(COLLECTION, ids=ids[start : start + 256], with_vectors=True, with_payload=True):
@@ -908,291 +811,271 @@ def main_vectors(ids: list[str]) -> dict[str, tuple[dict, dict]]:
     return out
 
 
-def lens_pool(lens: str, vec: dict, dense: Optional[dict], limit: int) -> list[str]:
-    """Point ids of the index images nearest to the origin in the spaces the lens looks at."""
-    client: QdrantClient = S["qdrant"]
-    # Global DINOv2 neighbours join every pool, so a lens works while the backfill is still running.
-    queries = {
-        "materia": [(DENSE, "texture", limit), (COLLECTION, "visual", limit // 2)],
-        "forma": [(DENSE, "layout", limit), (COLLECTION, "visual", limit // 2)],
-        "rime": [(COLLECTION, "visual", RHYME_POOL)],
-    }[lens]
-    ids: dict[str, None] = {}
-    for coll, space, n in queries:
-        if coll == DENSE and dense is None:
+def link_regions(reg: dict) -> list[dict]:
+    """Blobs worth a link, with their crop box (fractions of the image), centre and mask."""
+    gw, gh = reg["w"], reg["h"]
+    out = []
+    for mask in reg["masks"]:
+        area = float(mask.mean())
+        if not LINK_MIN_AREA <= area <= LINK_MAX_AREA:
             continue
-        q = (dense if coll == DENSE else vec)[space]
-        for p in client.query_points(coll, query=q.tolist(), using=space, limit=n).points:
-            ids[p.id] = None
-    return list(ids)
+        ys, xs = np.nonzero(mask)
+        x0, x1, y0, y1 = xs.min() / gw, (xs.max() + 1) / gw, ys.min() / gh, (ys.max() + 1) / gh
+        if (x0 == 0) + (y0 == 0) + (x1 == 1) + (y1 == 1) >= 3:
+            continue  # wraps around the picture: background
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        half_w = max((x1 - x0) * (1 + 2 * LINK_PAD), LINK_MIN_SIDE) / 2
+        half_h = max((y1 - y0) * (1 + 2 * LINK_PAD), LINK_MIN_SIDE) / 2
+        box = [max(0.0, cx - half_w), max(0.0, cy - half_h), min(1.0, cx + half_w), min(1.0, cy + half_h)]
+        # The hotspot sits on the blob itself (its centre of mass may fall outside a crescent shape).
+        k = int(np.argmin((xs - xs.mean()) ** 2 + (ys - ys.mean()) ** 2))
+        out.append({"mask": mask, "area": area, "box": box, "dot": [(xs[k] + 0.5) / gw, (ys[k] + 0.5) / gh]})
+    return sorted(out, key=lambda r: -r["area"])[: MAX_LINKS * 2]
 
 
-def rank_lens(lens: str, title: str, vec: dict, dense: Optional[dict], limit: int) -> list[dict]:
-    """Rank the lens pool. ``materia``: same surfaces and colour patterns (texture statistics);
-    ``forma``: same composition (layout grid); ``rime``: same form but a different subject: high
-    DINOv2 similarity (global, layout, texture) and low CLIP similarity, a visual rhyme."""
-    pool = main_vectors(lens_pool(lens, vec, dense, LENS_POOL))
-    pool.pop(point_id(title), None)
+def rank_links(origin: dict, vec: dict, regions: list[dict], crop_vis: np.ndarray, crop_sem: np.ndarray) -> list[dict]:
+    """Where each region leads: the index images most like its crop, by look and by subject, away
+    from the origin's own subject. Each image is used by one link only, so every link opens a
+    different door."""
+    client: QdrantClient = S["qdrant"]
+    own = point_id(origin["title"])
+    links: list[dict] = []
+    for r, cv, cs in zip(regions, crop_vis, crop_sem):
+        if float(cv @ vec["visual"]) > LINK_WHOLE:
+            continue
+        same = next((l for l in links if float(l["vis"] @ cv) > LINK_SAME_THING or float(l["sem"] @ cs) > LINK_SAME_SUBJECT), None)
+        if same:
+            same["mask"] = same["mask"] | r["mask"]
+            continue
+        links.append({**r, "vis": cv, "sem": cs})
+
+    ids: dict[str, None] = {}
+    for l in links:
+        for space, q in (("visual", l["vis"]), ("semantic", l["sem"])):
+            for p in client.query_points(COLLECTION, query=q.tolist(), using=space, limit=LINK_POOL).points:
+                ids[p.id] = None
+    pool = main_vectors([i for i in ids if i != own])
     if not pool:
         return []
-    items = [it for it, _ in pool.values()]
-    vis = np.stack([v["visual"] for _, v in pool.values()])
-    sem = np.stack([v["semantic"] for _, v in pool.values()])
-    pd = dense_vectors([it["title"] for it in items], parts=False) if dense is not None else {}
-    vis_sim, sem_sim = vis @ vec["visual"], sem @ vec["semantic"]
-
-    has = np.asarray([it["title"] in pd for it in items])
-
-    def dense_sim(space: str) -> np.ndarray:
-        """z-scored similarity in a dense space; images without descriptors yet get their z-scored
-        global DINOv2 similarity instead (same scale, so they can be compared)."""
-        out = zscore(vis_sim)
-        if has.sum() >= 2:
-            d = np.asarray([float(pd[it["title"]][space] @ dense[space]) for it in items if it["title"] in pd])
-            out[has] = zscore(d)
-        return out
-
-    if lens == "materia" or lens == "forma":
-        space = "texture" if lens == "materia" else "layout"
-        z = dense_sim(space) if dense is not None else zscore(vis_sim)
-        raw = np.asarray([float(pd[it["title"]][space] @ dense[space]) if it["title"] in pd else float(v)
-                          for it, v in zip(items, vis_sim)])
-        # Until the backfill is done, images that have the descriptor come first.
-        score = minmax(z + (2.0 if dense is not None else 0.0) * has)
-    else:
-        form = 0.6 * zscore(vis_sim) + (0.25 * dense_sim("layout") + 0.15 * dense_sim("texture") if dense is not None else 0.4 * zscore(vis_sim))
-        raw = vis_sim
-        score = minmax(form - RHYME_SEMANTIC * zscore(sem_sim))
-        # A rhyme must still look alike.
-        score[vis_sim < np.quantile(vis_sim, RHYME_FLOOR)] = -np.inf
-
+    keys = list(pool)
+    items = [pool[k][0] for k in keys]
+    vis = np.stack([pool[k][1]["visual"] for k in keys])
+    sem = np.stack([pool[k][1]["semantic"] for k in keys])
     quality = aesthetic(sem)
-    if float(aesthetic(vec["semantic"][None, :])[0]) >= PLAIN:
-        score = score + AESTH_SIMILAR * beauty(quality)
-        score[quality < JUNK] = -np.inf
-    picked: list[int] = []
-    for i in np.argsort(-score):
-        if not np.isfinite(score[i]) or float(vis[i] @ vec["visual"]) > NEAR_DUP:
+    away = sem @ vec["semantic"]
+    base = AESTH_SIMILAR * beauty(quality) - LINK_ESCAPE * away
+    if "blank" not in S:
+        S["blank"] = np.asarray(S["embedder"].embed_text(BLANK_PROMPTS), dtype=np.float32)
+    aspect = np.asarray([max(it["width"] or 1, 1) / max(it["height"] or 1, 1) for it in items], dtype=np.float32)
+    base[(quality < JUNK) | (vis @ vec["visual"] > NEAR_DUP) | (sem @ S["blank"] > BLANK)
+         | (aspect > MAX_ASPECT) | (aspect < 1 / MAX_ASPECT)] = -np.inf
+
+    for l in links:
+        l["score"] = 0.5 * (vis @ l["vis"]) + 0.5 * (sem @ l["sem"]) + base
+        l["best"] = float(np.max(l["score"]))
+    links.sort(key=lambda l: -l["best"])
+    used: set = set()
+    out = []
+    for l in links[:MAX_LINKS]:
+        picked: list[int] = []
+        for i in np.argsort(-l["score"]):
+            if not np.isfinite(l["score"][i]) or items[i]["title"] in used:
+                continue
+            if picked and float(np.max(vis[picked] @ vis[i])) > NEAR_DUP:
+                continue
+            picked.append(int(i))
+            if len(picked) >= LINK_TARGETS:
+                break
+        if not picked:
             continue
-        if picked and float(np.max(vis[picked] @ vis[i])) > NEAR_DUP:
-            continue
-        picked.append(int(i))
-        if len(picked) >= limit:
-            break
-    out = with_saved_flag([items[i] for i in picked])
-    for it, i in zip(out, picked):
-        it.update(match=round(float(raw[i]), 3), meaning=round(float(sem_sim[i]), 3))
+        used.update(items[i]["title"] for i in picked)
+        targets = with_saved_flag([items[i] for i in picked])
+        for t, i in zip(targets, picked):
+            t["match"] = round(float(0.5 * vis[i] @ l["vis"] + 0.5 * sem[i] @ l["sem"]), 3)
+        out.append({"box": [round(v, 4) for v in l["box"]], "dot": [round(float(v), 4) for v in l["dot"]],
+                    "mask": l["mask"], "sem": l["sem"], "items": targets})
     return out
 
 
-@app.get("/api/lens")
-async def lens(title: str, kind: str = Query("rime", pattern="^(rime|materia|forma)$"), limit: int = Query(60, ge=1, le=600)):
-    """Other ways for an image to be alike, searched in the whole local index (instant, no downloads
-    except the origin's own descriptors)."""
+@app.get("/api/page")
+async def page(title: str):
+    """An image as a page whose links are the things in it.
+
+    Returns the regions DINOv2 finds (``linkmap``: link index per patch, 255 = none, on a w x h grid)
+    and, for each link, its crop box, a hotspot and the images it leads to.
+    """
+    pages: OrderedDict = S.setdefault("pages", OrderedDict())
+    if title in pages:
+        pages.move_to_end(title)
+        return pages[title]
     origin = await resolve(title)
     if not origin:
         raise HTTPException(404, "Immagine non trovata")
     vecs, _ = await ensure_vectors([origin], new_budget=1)
     if title not in vecs:
         raise HTTPException(502, "L'immagine non risponde, riprova tra poco")
-    dense = await ensure_dense(origin)
-    items = await asyncio.to_thread(rank_lens, kind, title, vecs[title], dense, limit)
-    return {"origin": with_saved_flag([origin])[0], "items": items, "dense": S["qdrant"].count(DENSE).count}
-
-
-async def patch_map(title: str) -> tuple[dict, dict]:
-    """The origin seen patch by patch (``Embedder.patch_map``), kept for the last few images opened."""
-    maps: OrderedDict = S.setdefault("maps", OrderedDict())
-    if title in maps:
-        maps.move_to_end(title)
-        return maps[title]
-    item = await resolve(title)
-    if not item:
-        raise HTTPException(404, "Immagine non trovata")
+    t0 = time.time()
+    commons: Commons = S["commons"]
     try:
-        image = await S["commons"].fetch_image(item["thumb"])
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, "L'immagine non risponde, riprova tra poco") from exc
+        image = await commons.fetch_image(large_url(origin))
+    except Exception:  # noqa: BLE001 - the grid thumbnail will do
+        image = await commons.fetch_image(origin["thumb"])
+
     async with S["embed_lock"]:
-        m = await asyncio.to_thread(S["embedder"].patch_map, image)
-    maps[title] = (item, m)
-    while len(maps) > MAPS_CACHED:
-        maps.popitem(last=False)
-    return item, m
+        reg = await asyncio.to_thread(S["embedder"].regions, image)
+        W, H = image.size
+        regions, crops = [], []
+        for r in link_regions(reg):
+            b = r["box"]
+            crop = image.crop((int(b[0] * W), int(b[1] * H), int(b[2] * W), int(b[3] * H)))
+            grey = np.asarray(crop.convert("L").resize((64, 64)), dtype=np.float32)
+            if grey.std() < LINK_MIN_CONTRAST or grey.mean() < LINK_MIN_LIGHT:
+                continue  # nothing to see there: a shadow, a blank wall, an empty sky
+            regions.append(r)
+            crops.append(crop)
+        crop_vis, crop_sem = await asyncio.to_thread(S["embedder"].embed_batch, crops) if crops else ([], [])
+    links = await asyncio.to_thread(
+        rank_links, origin, vecs[title], regions, np.asarray(crop_vis, dtype=np.float32), np.asarray(crop_sem, dtype=np.float32))
+
+    linkmap = np.full((reg["h"], reg["w"]), 255, dtype=np.uint8)
+    for i, l in enumerate(links):
+        linkmap[l.pop("mask") & (linkmap == 255)] = i
+    S.setdefault("crops", {})[title] = [l.pop("sem") for l in links]  # for naming the links (/api/concepts)
+    result = {"origin": with_saved_flag([origin])[0], "w": reg["w"], "h": reg["h"],
+              "linkmap": base64.b64encode(linkmap.tobytes()).decode(), "links": links}
+    pages[title] = result
+    while len(pages) > PAGES_CACHED:
+        pages.popitem(last=False)
+    log.info("page %s: %d regions, %d links, %.1fs", title, len(regions), len(links), time.time() - t0)
+    return result
 
 
-def b64(a: np.ndarray) -> str:
-    return base64.b64encode(np.ascontiguousarray(a, dtype=np.uint8).tobytes()).decode()
+def label_vectors(labels: list[str]) -> np.ndarray:
+    """CLIP text vectors of "a photo of <label>", cached."""
+    cache = S.setdefault("label_vectors", {})
+    todo = [l for l in dict.fromkeys(labels) if l not in cache]
+    if todo:
+        for l, v in zip(todo, S["embedder"].embed_texts([f"a photo of {l}." for l in todo])):
+            cache[l] = v
+    return np.stack([cache[l] for l in labels]) if labels else np.zeros((0, SEMANTIC_DIM), np.float32)
 
 
-@app.get("/api/dino")
-async def dino(title: str):
-    """What DINOv2 sees: a colour per patch (similar parts, similar colours) and its regions."""
-    _, m = await patch_map(title)
-    return {"w": m["w"], "h": m["h"], "rgb": b64(m["rgb"]), "segments": b64(m["segments"])}
+def explainable(c: Optional[dict]) -> bool:
+    """A concept worth a link: it has a Wikipedia article and is a thing, not a place, person or work."""
+    return bool(c and c.get("title") and not c.get("category_item") and not PLACE_OR_WORK.search(c.get("description", "")))
 
 
-@app.get("/api/detail")
-async def detail(title: str, x: float = Query(..., ge=0, le=1), y: float = Query(..., ge=0, le=1),
-                 limit: int = Query(60, ge=1, le=300)):
-    """Images that contain the detail at (x, y) of ``title``: the DINOv2 patches of that region
-    around the point, matched against the regions (``parts``) of every indexed image."""
-    origin, m = await patch_map(title)
-    w, h = m["w"], m["h"]
-    gx, gy = min(w - 1, int(x * w)), min(h - 1, int(y * h))
-    ys, xs = np.mgrid[0:h, 0:w]
-    dist = (np.hypot(xs - gx, ys - gy) / max(w, h)).flatten()
-    sel = (m["segments"] == m["segments"][gy * w + gx]) & (dist <= DETAIL_RADIUS)
-    if sel.sum() < 4:
-        sel = dist <= DETAIL_RADIUS * 0.6
-    query = unit(m["tokens"][sel].mean(0))
-
-    def run() -> list[dict]:
-        client: QdrantClient = S["qdrant"]
-        res = client.query_points(DENSE, query=[query.tolist()], using="parts", limit=LENS_POOL, with_payload=True)
-        found = {p.id: p.score for p in res.points}
-        pool = main_vectors(list(found))
-        own = point_id(title)
-        ids = [i for i in found if i in pool and i != own]
-        if not ids:
-            return []
-        sem = np.stack([pool[i][1]["semantic"] for i in ids])
-        vis = np.stack([pool[i][1]["visual"] for i in ids])
-        raw = np.asarray([found[i] for i in ids], dtype=np.float32)
-        score = minmax(raw)
-        quality = aesthetic(sem)
-        score = score + 0.5 * AESTH_SIMILAR * beauty(quality)
-        score[quality < JUNK] = -np.inf
-        origin_v = S["qdrant"].retrieve(COLLECTION, ids=[own], with_vectors=["visual"])
-        ov = np.asarray(origin_v[0].vector["visual"], dtype=np.float32) if origin_v else None
-        picked: list[int] = []
-        for i in np.argsort(-score):
-            if not np.isfinite(score[i]) or (ov is not None and float(vis[i] @ ov) > NEAR_DUP):
-                continue
-            if picked and float(np.max(vis[picked] @ vis[i])) > NEAR_DUP:
-                continue
-            picked.append(int(i))
-            if len(picked) >= limit:
-                break
-        # Where the detail is in each result: its best-matching region.
-        dense = dense_vectors([pool[ids[i]][0]["title"] for i in picked])
-        out = with_saved_flag([pool[ids[i]][0] for i in picked])
-        for it, i in zip(out, picked):
-            it["match"] = round(float(raw[i]), 3)
-            d = dense.get(it["title"])
-            if d is not None and d["parts_xy"]:
-                j = int(np.argmax(d["parts"] @ query))
-                fx, fy, share = d["parts_xy"][j]
-                it["focus"] = {"x": fx, "y": fy, "r": round(float(np.sqrt(share)), 3)}
-        return out
-
-    items = await asyncio.to_thread(run)
-    log.info("detail %s at (%.2f, %.2f): %d patches, %d results", title, x, y, int(sel.sum()), len(items))
-    return {"origin": with_saved_flag([origin])[0], "items": items, "mask": b64(sel), "w": w, "h": h}
+async def summarize(c: dict) -> dict:
+    """A concept as the UI shows it: {"qid", "name", "description", "about", "lang", "extract",
+    "image", "url"} (the article's summary), cached by Wikidata id."""
+    cache: OrderedDict = S.setdefault("concepts", OrderedDict())
+    if c["qid"] in cache:
+        return cache[c["qid"]]
+    out = {k: c.get(k) for k in ("qid", "name", "description", "lang")}
+    out["about"] = c.get("title")
+    if c.get("title"):
+        try:
+            out.update(await S["commons"].summary(c["lang"], c["title"]))
+        except Exception as exc:  # noqa: BLE001 - the name alone still says what it is
+            log.warning("summary %s: %s", c["title"], exc)
+    cache[c["qid"]] = out
+    while len(cache) > CONCEPTS_CACHED:
+        cache.popitem(last=False)
+    return out
 
 
-def drift_step(walk: dict) -> Optional[dict]:
-    """One step of a walk: pick a kind of link, then the next image among the best few for it.
-    A link with nothing left to offer gives way to the others."""
-    cur = walk["path"][-1]
-    pid = point_id(cur)
-    got = main_vectors([pid])
-    if pid not in got:
-        return None
-    vec = got[pid][1]
-    dense = dense_vectors([cur], parts=False).get(cur)
-    links = [k for k in DRIFT_LINKS if k != walk["last"] and (dense is not None or k in ("sguardo", "senso", "rima"))]
-    while links:
-        link = random.choices(links, weights=[DRIFT_LINKS[k] for k in links])[0]
-        step = drift_link(walk, link, vec, dense)
-        if step:
-            return step
-        links.remove(link)
-    return None
+@app.get("/api/concepts")
+async def concepts(title: str):
+    """What each link of ``title``'s page is about (same order as /api/page's links), so a detail
+    leads to what explains it: a drop on a leaf to surface tension, a wheel to the Ferris wheel.
+    A few batched requests per page: Wikimedia answers 429 to many small ones."""
+    data = await page(title)
+    crops = S.get("crops", {}).get(title)
+    if not data["links"] or crops is None:
+        return {"concepts": []}
+    files, weights, owner = [], [], []
+    for i, l in enumerate(data["links"]):
+        for rank, it in enumerate(l["items"]):
+            if it["title"].startswith("File:"):
+                files.append(it["title"])
+                weights.append(0.85 ** rank)
+                owner.append(i)
+    try:
+        # One lookup for every file of every link, then votes split per link.
+        commons: Commons = S["commons"]
+        uniq = list(dict.fromkeys(files + ([title] if title.startswith("File:") else [])))
+        filed, depicted = await asyncio.gather(commons.categories_of(uniq), commons.depicts_of(uniq))
+        cats = list(dict.fromkeys(c for f in uniq for c in filed.get(f, [])
+                                  if not ARCHIVE_NAME.search(c.removeprefix("Category:"))))
+        arts = await commons.articles(cats)
+
+        def named(f: str) -> set:
+            return set(depicted.get(f, [])), {arts[c]["qid"] for c in filed.get(f, []) if arts.get(c, {}).get("qid")}
+
+        per_link: list[dict[str, float]] = [{} for _ in data["links"]]
+        for f, w, i in zip(files, weights, owner):
+            dep, top = named(f)
+            for q in dep:
+                per_link[i][q] = per_link[i].get(q, 0.0) + CONCEPT_DEPICTS * w
+            for q in top:
+                per_link[i][q] = per_link[i].get(q, 0.0) + w
+        if title.startswith("File:"):
+            dep, top = named(title)
+            for votes in per_link:
+                for q in dep | top:
+                    votes[q] = votes.get(q, 0.0) + CONCEPT_OWN
+        info = await commons.concepts(list({q for votes in per_link for q in votes}))
+        good = {q: c for q, c in info.items() if explainable(c)}
+        try:
+            for q in await commons.individuals(list(good)):
+                good.pop(q, None)
+        except Exception as exc:  # noqa: BLE001 - query service busy: the description filter has to do
+            log.warning("individuals: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("concepts %s: %s", title, exc)
+        return {"concepts": [None] * len(data["links"])}
+    qids = list(good)
+    vectors = dict(zip(qids, await asyncio.to_thread(label_vectors, [good[q]["en"] for q in qids]))) if qids else {}
+
+    chosen: list[Optional[str]] = []
+    for votes, crop in zip(per_link, crops):
+        ranked = sorted((q for q in votes if q in good),
+                        key=lambda q: -(float(vectors[q] @ crop) + CONCEPT_CONSENSUS * min(votes[q], 6)))
+        chosen.append(next((q for q in ranked if q not in chosen), None))
+    found = await asyncio.gather(*(summarize(good[q]) if q else asyncio.sleep(0) for q in chosen))
+    log.info("concepts %s: %s", title, [f.get("name") if f else None for f in found])
+    return {"concepts": [f or None for f in found]}
 
 
-def drift_link(walk: dict, link: str, vec: dict, dense: Optional[dict]) -> Optional[dict]:
-    client: QdrantClient = S["qdrant"]
-    coll, space, q = {
-        "forma": (DENSE, "layout", dense and dense["layout"]),
-        "materia": (DENSE, "texture", dense and dense["texture"]),
-        "sguardo": (COLLECTION, "visual", vec["visual"]),
-        "senso": (COLLECTION, "semantic", vec["semantic"]),
-        "rima": (COLLECTION, "visual", vec["visual"]),
-    }[link]
-    if link == "rima" and len(walk["recent"]) >= 3:
-        q = unit(vec["visual"] - DRIFT_RESIDUAL * np.mean(walk["recent"][-DRIFT_NOVELTY_STEPS - 1 : -1], axis=0))
-    n = RHYME_POOL // 2 if link == "rima" else DRIFT_POOL
-    res = client.query_points(coll, query=q.tolist(), using=space, limit=n + len(walk["path"]))
-    found = {p.id: p.score for p in res.points}
-    pool = main_vectors(list(found))
-    ids = [i for i in found if i in pool and pool[i][0]["title"] not in walk["seen"]]
-    if not ids:
-        return None
-    vis = np.stack([pool[i][1]["visual"] for i in ids])
-    sem = np.stack([pool[i][1]["semantic"] for i in ids])
-    raw = np.asarray([found[i] for i in ids], dtype=np.float32)
-    if link == "rima":
-        score = minmax(zscore(raw) - RHYME_SEMANTIC * zscore(sem @ vec["semantic"]))
-        score[raw < np.quantile(raw, RHYME_FLOOR)] = -np.inf
-    else:
-        score = minmax(raw)
-    # Momentum: keep moving the way the last step went instead of falling back.
-    if walk["prev"] is not None:
-        direction = unit(vec["visual"] - walk["prev"])
-        steps = vis - vec["visual"]
-        steps /= np.linalg.norm(steps, axis=1, keepdims=True) + 1e-6
-        score = score + DRIFT_MOMENTUM * (steps @ direction)
-    quality = aesthetic(sem)
-    score = score + AESTH_SIMILAR * beauty(quality)
-    # Stay among beautiful pictures, unless the walk is among documents / plain shots already.
-    plain_here = float(aesthetic(vec["semantic"][None, :])[0]) < PLAIN
-    score[quality < (JUNK if plain_here else PLAIN)] = -np.inf
-    recent = np.stack(walk["recent"])
-    score[np.max(vis @ recent.T, axis=1) > NEAR_DUP] = -np.inf
-    lately = np.stack(walk["recent_sem"][-DRIFT_NOVELTY_STEPS:])
-    score = score - DRIFT_NOVELTY * np.max(sem @ lately.T, axis=1)  # absolute: a pool of one species stays penalised
-    top = [int(i) for i in np.argsort(-score)[:DRIFT_TOP] if np.isfinite(score[i])]
-    if not top:
-        return None
-    p = np.exp((score[top] - score[top].max()) / DRIFT_TEMPERATURE)
-    i = int(np.random.choice(top, p=p / p.sum()))
-    item = pool[ids[i]][0]
-    walk["prev"] = vec["visual"]
-    walk["last"] = link
-    walk["path"].append(item["title"])
-    walk["seen"].add(item["title"])
-    walk["recent"] = (walk["recent"] + [vis[i]])[-DRIFT_RECENT:]
-    walk["recent_sem"] = (walk["recent_sem"] + [sem[i]])[-DRIFT_RECENT:]
-    return {**item, "link": link, "match": round(float(raw[i]), 3)}
-
-
-@app.get("/api/drift")
-async def drift(title: str, walk: Optional[str] = None, steps: int = Query(8, ge=1, le=24)):
-    """A walk ("deriva") through the index from ``title``; call again with ``walk`` to go on."""
-    walks: OrderedDict = S.setdefault("walks", OrderedDict())
-    w = walks.get(walk) if walk else None
-    if w is None:
-        origin = await resolve(title)
-        if not origin:
-            raise HTTPException(404, "Immagine non trovata")
-        vecs, _ = await ensure_vectors([origin], new_budget=1)
-        if title not in vecs:
-            raise HTTPException(502, "L'immagine non risponde, riprova tra poco")
-        await ensure_dense(origin)
-        walk = uuid.uuid4().hex[:12]
-        w = {"path": [title], "seen": {title}, "prev": None, "last": None, "recent": [vecs[title]["visual"]],
-             "recent_sem": [vecs[title]["semantic"]]}
-        walks[walk] = w
-        while len(walks) > 50:
-            walks.popitem(last=False)
-    out = []
-    for _ in range(steps):
-        step = await asyncio.to_thread(drift_step, w)
-        if step is None:
-            break
-        out.append(step)
-    return {"walk": walk, "steps": with_saved_flag(out)}
+@app.get("/api/concept")
+async def concept(qid: str = Query(..., pattern=r"^Q\d+$"), offset: int = Query(0, ge=0)):
+    """A concept page: the article, the images that depict it (plus its Commons category's), and
+    "voci collegate": the other concepts those images depict."""
+    commons: Commons = S["commons"]
+    info = (await commons.concepts([qid], claims=True)).get(qid)
+    if not info:
+        raise HTTPException(404, "Voce non trovata")
+    head = await summarize(info)
+    items, nxt = await commons.search(f"haswbstatement:P180={qid}", offset=offset, limit=CONCEPT_PAGE)
+    related: list[dict] = []
+    if offset == 0:
+        if info.get("category") and len(items) < 24:
+            more, _ = await commons.category_files(info["category"], limit=CONCEPT_PAGE)
+            seen = {it["title"] for it in items}
+            items += [it for it in more if it["title"] not in seen]
+        try:
+            depicted = await commons.depicts_of([it["title"] for it in items[:50]])
+            counts: dict[str, int] = {}
+            for qs in depicted.values():
+                for q in set(qs) - {qid}:
+                    counts[q] = counts.get(q, 0) + 1
+            top = [q for q, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:24]]
+            near = await commons.concepts(top)
+            ones = await commons.individuals([q for q in top if explainable(near.get(q))])
+            related = [{"qid": q, "name": near[q]["name"]} for q in top if explainable(near.get(q)) and q not in ones][:14]
+        except Exception as exc:  # noqa: BLE001 - the page works without them
+            log.warning("related %s: %s", qid, exc)
+    return {**head, "items": with_saved_flag(items), "next": nxt, "related": related}
 
 
 def interest_seeds() -> list[str]:
