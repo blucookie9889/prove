@@ -11,3 +11,4 @@ python-multipart>=0.0.9
 numpy>=1.26.0
 sentencepiece>=0.2.0
 sacremoses>=0.1.1
+anthropic>=0.125

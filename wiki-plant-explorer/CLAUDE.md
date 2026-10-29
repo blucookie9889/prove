@@ -7,10 +7,12 @@ through their public APIs. Click an image to get visually similar ones; "più co
 refines the ranking, opened and saved images feed a personal "Per te" home, and a background crawler
 keeps growing a local vector index. No image is ever stored on disk: only vectors.
 
-The core is the image page: like the words of a Wikipedia article, the things inside an image (found
-by DINOv2) are links. Hover one to see what it is (a Wikipedia concept: a drop on a leaf → "Effetto
-loto"), click to open that concept's page ("voce"): the article's summary, the images that depict it,
-related concepts; every image opens another image page. Image → detail → concept → image → …
+The core is the flow (`?flow=<title>`): a continuous stream of stimuli. A curator (Claude, when
+`ANTHROPIC_API_KEY` is set) looks at each picture and opens doors from details in it to concepts
+worth knowing (the mechanism, the cause, the same principle far away, the human story, another
+scale); each door is grounded in its Wikipedia article and shown with the best picture of it the
+person has not seen yet. Scrolling takes the door farthest from where they have been; clicking one
+takes that one. No trail: only what comes next. Quality of knowledge and pictures comes first.
 
 ## Architecture
 
@@ -20,9 +22,10 @@ backend/sources.py   other collections (Cleveland, iNaturalist, Unsplash, Pexels
                      the Commons shape; `Budget` caps requests per hour for the keyed APIs
 backend/translator.py  local MarianMT Italian -> English
 .env                 UNSPLASH_ACCESS_KEY / PEXELS_API_KEY (git-ignored; template in .env.example)
+backend/curator.py   Claude (claude-opus-5-5) sees a picture, returns doors as structured JSON
 backend/embedder.py  DINOv2 (visual, 768-d) + OpenCLIP ViT-B-32 (semantic, 512-d), batched, L2-normalised;
                      `regions`: an image's parts from DINOv2 patch tokens (k-means + connected blobs)
-backend/main.py      FastAPI: /api/foryou, /api/feed, /api/search, /api/file, /api/page, /api/concepts,
+backend/main.py      FastAPI: /api/flow, /api/foryou, /api/feed, /api/search, /api/file, /api/page, /api/concepts,
                      /api/concept, /api/similar, /api/vote,
                      /api/view, /api/saved, /api/health; background crawler
 frontend/            React 19 + Vite 6 + Tailwind 4, white image-first UI; Vite proxies /api to the backend
@@ -32,8 +35,9 @@ state/feedback.json  votes, saved images and opened images ("views") (git-ignore
 state/crawler.json   crawler cursors, done categories, interest categories and queries (git-ignored)
 ```
 
-- UI language is Italian. Routes are URL params: `?q=`, `?file=<title>&q=`, `?c=<Wikidata id>` (a voce),
-  `?view=saved`, `?view=featured`.
+- UI language is Italian; look and motion follow the portfolio art direction (warm paper, Geist 15px,
+  two tones, hairlines, slow eased motion). Routes are URL params: `?q=`, `?flow=<title>` (`?file=`
+  opens the flow too), `?view=saved`, `?view=featured`.
 - Item titles: Commons keeps `File:...`; other collections use `cma:<id>`, `inat:<observation id>`,
   `unsplash:<id>`, `pexels:<id>`. `resolve(title)` looks any of them up again (index payload first,
   so keyed APIs aren't charged); every item carries `source`.
@@ -101,6 +105,25 @@ pops a preview of where it leads; click → the crop, drawn over itself, is name
 Transition grows it into the next image ("dive"). On touch, a first tap previews and a second follows.
 "In questa immagine" lists every link: the crop, then its targets. The trail at the top is the way
 here, with the crop that led to each step (stored in sessionStorage with the step).
+
+## Flow (`POST /api/flow {title, via}`)
+
+1. Curator (`curator.py`): the picture (1024 px JPEG, in memory) + the concept that led here + the
+   concepts already met (`flow_memory()["seen"]`, never lead back). Claude Opus 5.5, effort medium,
+   structured output (`SCHEMA`): `seeing` + 5 doors {anchor, box, leap ∈ dentro/perché/altrove/
+   storia/scala, title, wikipedia_it/en, hook, image_query}. `fallbacks: "default"` (beta
+   `server-side-fallback-2026-07-01`) re-runs a declined request on Anthropic's fallback model.
+2. `ground`: a door is kept only if its Wikipedia article exists (Italian first, not a
+   disambiguation); the extract shown is Wikipedia's, the hook is the curator's one line.
+3. `door_pictures`: the article's lead image + Commons "Quality images" search + all Commons (+
+   Unsplash/Pexels with keys) for image_query, then the English title, then a shorter query, until 8
+   candidates. Embedded, kept if CLIP relevance ≥ best − 0.05 and beauty ≥ PLAIN, not like a picture
+   already shown on the journey (DINOv2 > 0.85, last 200) nor taken by another door; ranked by
+   relevance + beauty + 0.02 for curated.
+4. `farthest`: the door scrolling takes = lowest CLIP text similarity to the concepts met, +0.05 for
+   altrove/scala. The frontend prefetches it.
+Without a key the doors are `/api/concepts`' Wikimedia concepts of the image's DINOv2 parts.
+Cost with a key: one Opus call per picture (~3k tokens in, ~3k out with thinking).
 
 ## Concepts: what a detail is (`/api/concepts`, `/api/concept`)
 

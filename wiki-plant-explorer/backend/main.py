@@ -18,6 +18,7 @@ import os
 import random
 import re
 import time
+import urllib.parse
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -30,6 +31,7 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient, models
 
 from .commons import Commons
+from .curator import Curator
 from .sources import Cleveland, INaturalist, Pexels, RateLimited, Unsplash
 from .translator import Translator
 from .embedder import SEMANTIC_DIM, VISUAL_DIM, Embedder
@@ -114,6 +116,14 @@ LINK_TARGETS = 10
 # door in a painting leads to doors, not to more of the same painting.
 LINK_ESCAPE = 0.5
 PAGES_CACHED = 32
+# Flow: a continuous stream of stimuli. Each image opens doors (the curator's, see curator.py, or
+# without an API key the Wikimedia concepts of its parts); each door is grounded in its Wikipedia
+# article and shown with the best picture of it that the person has not seen yet.
+FLOW_CACHED = 64
+FLOW_SPREAD = 0.05  # pictures within this CLIP relevance of the best one compete on beauty
+FLOW_SAME_LOOK = 0.85  # DINOv2 cosine to a picture already shown: too much of the same
+FLOW_RECENT = 200  # pictures remembered for that
+FLOW_CURATED = 0.02  # bonus for community-reviewed pictures (Quality / Featured)
 # Link targets must be pictures: no game textures or swatches (CLIP close to "blank" prompts; 99.9%
 # of the index is below 0.26), no strips (scrolls 900 x 12 px are unreadable as a thumbnail).
 BLANK_PROMPTS = ["a solid color image", "a blank empty image", "a plain black rectangle", "a uniform flat colour background"]
@@ -162,6 +172,9 @@ async def lifespan(_: FastAPI):
     aesthetic(np.zeros((1, SEMANTIC_DIM), dtype=np.float32))  # encode the beauty prompts once
     S["commons"] = Commons()
     S["sources"] = make_sources(S["commons"])
+    key = load_env().get("ANTHROPIC_API_KEY")
+    S["curator"] = Curator(key) if key else None
+    log.info("curator: %s", "Claude (%s)" % S["curator"].model if key else "off, no ANTHROPIC_API_KEY: Wikimedia concepts only")
     log.info("sources: Wikimedia Commons, %s", ", ".join(src.label for src in S["sources"].values()))
     client = QdrantClient(path=str(DB_PATH))
     if not client.collection_exists(COLLECTION):
@@ -196,7 +209,7 @@ def load_env() -> dict:
             key, sep, value = line.strip().partition("=")
             if sep and not key.startswith("#"):
                 env[key.strip()] = value.strip().strip("'\"")
-    env.update({k: v for k, v in os.environ.items() if k in ("UNSPLASH_ACCESS_KEY", "PEXELS_API_KEY")})
+    env.update({k: v for k, v in os.environ.items() if k in ("UNSPLASH_ACCESS_KEY", "PEXELS_API_KEY", "ANTHROPIC_API_KEY")})
     return env
 
 
@@ -1076,6 +1089,195 @@ async def concept(qid: str = Query(..., pattern=r"^Q\d+$"), offset: int = Query(
         except Exception as exc:  # noqa: BLE001 - the page works without them
             log.warning("related %s: %s", qid, exc)
     return {**head, "items": with_saved_flag(items), "next": nxt, "related": related}
+
+
+def flow_memory() -> dict:
+    """What this person has met on their journeys: concept titles and the pictures shown."""
+    return S.setdefault("flow", {"seen": [], "looks": []})
+
+
+def remember_look(v: np.ndarray) -> None:
+    looks = flow_memory()["looks"]
+    looks.append(v)
+    del looks[:-FLOW_RECENT]
+
+
+def commons_file(url: Optional[str]) -> Optional[str]:
+    """"File:Name.jpg" from an upload.wikimedia.org URL (original or thumbnail)."""
+    if not url or "upload.wikimedia.org" not in url:
+        return None
+    parts = urllib.parse.unquote(url.split("?")[0]).split("/")
+    name = parts[-2] if "/thumb/" in url else parts[-1]
+    return f"File:{name}"
+
+
+async def door_pictures(queries: list[str], taken: set, lead: Optional[str] = None) -> list[dict]:
+    """The best pictures of a concept: curated Commons first (Quality images), then all of Commons and
+    the keyed photo libraries, plus the lead image of its Wikipedia article; the next query is tried
+    while there are too few. Kept only if CLIP finds the concept in them (against the first query),
+    ranked by relevance and beauty, never a picture like one already shown on this journey or taken
+    by another door."""
+    commons: Commons = S["commons"]
+    cands: list[dict] = []
+    curated: set = set()
+
+    def add(items: list[dict], is_curated: bool = False) -> None:
+        for it in items:
+            if it["title"] in taken or any(c["title"] == it["title"] for c in cands):
+                continue
+            cands.append(it)
+            if is_curated:
+                curated.add(it["title"])
+
+    lead_file = commons_file(lead)
+    if lead_file:
+        try:
+            add(await commons.files([lead_file]), True)
+        except Exception:  # noqa: BLE001
+            pass
+    for query in [q for q in dict.fromkeys(queries) if q]:
+        jobs = [commons.search(query, limit=8, curated=True), commons.search(query, limit=6)]
+        jobs += [src.search(query, limit=4) for key, src in S["sources"].items() if key in ("unsplash", "pexels")]
+        for n, r in enumerate(await asyncio.gather(*jobs, return_exceptions=True)):
+            if not isinstance(r, Exception):
+                add(r[0], n == 0)
+        if len(cands) >= 8:
+            break
+    if not cands:
+        return []
+    query = queries[0]
+    vecs, _ = await ensure_vectors(cands, new_budget=len(cands))
+    cands = [c for c in cands if c["title"] in vecs]
+    if not cands:
+        return []
+    sem = np.stack([vecs[c["title"]]["semantic"] for c in cands])
+    vis = np.stack([vecs[c["title"]]["visual"] for c in cands])
+    rel = sem @ text_vector(query)
+    quality = aesthetic(sem)
+    score = rel + AESTH_SEARCH * beauty(quality) + np.asarray([FLOW_CURATED if c["title"] in curated else 0.0 for c in cands])
+    ok = (rel >= rel.max() - FLOW_SPREAD) & (quality >= PLAIN)
+    looks = flow_memory()["looks"]
+    if looks:
+        ok &= np.max(vis @ np.stack(looks).T, axis=1) <= FLOW_SAME_LOOK
+    picked: list[int] = []
+    for i in np.argsort(-score):
+        if not ok[i] or (picked and float(np.max(vis[picked] @ vis[i])) > NEAR_DUP):
+            continue
+        picked.append(int(i))
+        if len(picked) == 4:
+            break
+    return [cands[i] for i in picked]
+
+
+async def wikipedia(it_title: str, en_title: str) -> Optional[dict]:
+    """The Wikipedia summary of a concept, Italian first; None if neither article exists."""
+    for lang, title in (("it", it_title), ("en", en_title)):
+        if not title:
+            continue
+        try:
+            sm = await S["commons"].summary(lang, title)
+        except Exception:  # noqa: BLE001 - no such article
+            continue
+        if sm.get("extract") and sm.get("kind") != "disambiguation":
+            return {"lang": lang, "about": title, **sm}
+    return None
+
+
+async def ground(door: dict, taken: set) -> Optional[dict]:
+    """A curator's door, kept only if Wikipedia has its article and a fitting picture exists."""
+    art = await wikipedia(door["wikipedia_it"], door["wikipedia_en"])
+    if not art:
+        log.info("flow: dropped %r (no article)", door["title"])
+        return None
+    short = " ".join(door["image_query"].split()[:2])
+    pics = await door_pictures([door["image_query"], door["wikipedia_en"], short], taken, art.get("image"))
+    if not pics:
+        log.info("flow: dropped %r (%s)", door["title"], "no article" if not art else "no picture")
+        return None
+    taken.update(p["title"] for p in pics)
+    box = [min(1.0, max(0.0, float(door[k]))) for k in ("x0", "y0", "x1", "y1")]
+    return {
+        "anchor": door["anchor"], "box": box, "dot": [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2],
+        "leap": door["leap"], "title": door["title"], "hook": door["hook"],
+        "about": art["about"], "lang": art["lang"], "extract": art["extract"], "url": art.get("url"),
+        "item": with_saved_flag(pics[:1])[0], "more": pics[1:],
+    }
+
+
+async def wikimedia_doors(title: str) -> tuple[str, list[dict]]:
+    """Doors without the curator: the parts of the image named by Wikimedia concepts (/api/concepts)."""
+    data = await page(title)
+    named = (await concepts(title))["concepts"]
+    doors = []
+    for l, c in zip(data["links"], named):
+        if not c or not c.get("extract"):
+            continue
+        hook = re.split(r"(?<=[.!?])\s", c["extract"], maxsplit=1)[0]
+        doors.append({"anchor": "", "box": l["box"], "dot": l["dot"], "leap": "dentro", "title": c["name"], "hook": hook,
+                      "about": c.get("about"), "lang": c.get("lang"), "extract": c["extract"], "url": c.get("url"),
+                      "item": l["items"][0], "more": l["items"][1:4]})
+    return "", doors
+
+
+def farthest(doors: list[dict]) -> int:
+    """The door to take when the person just keeps scrolling: the one farthest from where they have
+    been (CLIP text similarity of its title to the concepts met), cross-field leaps first."""
+    if not doors:
+        return -1
+    seen = flow_memory()["seen"][-40:]
+    titles = [d["title"] for d in doors]
+    vt = label_vectors(titles)
+    novelty = 1 - (np.max(vt @ label_vectors(seen).T, axis=1) if seen else np.zeros(len(doors)))
+    novelty += np.asarray([0.05 if d["leap"] in ("altrove", "scala") else 0.0 for d in doors])
+    return int(np.argmax(novelty))
+
+
+class FlowStep(BaseModel):
+    title: str  # the picture
+    via: Optional[str] = None  # the concept that led to it
+
+
+@app.post("/api/flow")
+async def flow(step: FlowStep):
+    """The doors out of one picture of the stream, and which one to take next if the person just scrolls."""
+    cache: OrderedDict = S.setdefault("flow_cache", OrderedDict())
+    if step.title in cache:
+        return cache[step.title]
+    item = await resolve(step.title)
+    if not item:
+        raise HTTPException(404, "Immagine non trovata")
+    vecs, _ = await ensure_vectors([item], new_budget=1)
+    if step.title in vecs:
+        remember_look(vecs[step.title]["visual"])
+    mem = flow_memory()
+    if step.via:
+        mem["seen"].append(step.via)
+    t0 = time.time()
+    seeing, doors = "", []
+    curator: Optional[Curator] = S.get("curator")
+    if curator:
+        try:
+            image = await S["commons"].fetch_image(large_url(item))
+        except Exception:  # noqa: BLE001
+            image = await S["commons"].fetch_image(item["thumb"])
+        data = await curator.doors(image, item["name"], step.via, mem["seen"])
+        if data:
+            seeing = data.get("seeing") or ""
+            taken = {step.title}
+            grounded = await asyncio.gather(*(ground(d, taken) for d in data.get("doors", [])[:7]))
+            doors = [d for d in grounded if d]
+    if not doors:
+        seeing, doors = await wikimedia_doors(step.title)
+    nxt = await asyncio.to_thread(farthest, doors)
+    mem["seen"].extend(d["title"] for d in doors)
+    del mem["seen"][:-200]
+    result = {"item": with_saved_flag([item])[0], "seeing": seeing, "doors": doors, "next": nxt,
+              "curator": bool(curator)}
+    cache[step.title] = result
+    while len(cache) > FLOW_CACHED:
+        cache.popitem(last=False)
+    log.info("flow %s: %d doors in %.1fs", step.title, len(doors), time.time() - t0)
+    return result
 
 
 def interest_seeds() -> list[str]:
