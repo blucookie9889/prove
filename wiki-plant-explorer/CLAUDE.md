@@ -7,8 +7,8 @@ through their public APIs. Click an image to get visually similar ones; "più co
 refines the ranking, opened and saved images feed a personal "Per te" home, and a background crawler
 keeps growing a local vector index. No image is ever stored on disk: only vectors.
 
-The core is the flow (`?flow=<title>`): a continuous stream of stimuli. A curator (Claude, when
-`ANTHROPIC_API_KEY` is set) looks at each picture and opens doors from details in it to concepts
+The core is the flow (`?flow=<title>`): a continuous stream of stimuli. A curator (Gemini with a free
+Google AI Studio key, a free local vision-language model through Ollama, or Claude with a paid key) looks at each picture and opens doors from details in it to concepts
 worth knowing (the mechanism, the cause, the same principle far away, the human story, another
 scale); each door is grounded in its Wikipedia article and shown with the best picture of it the
 person has not seen yet. Scrolling takes the door farthest from where they have been; clicking one
@@ -21,8 +21,11 @@ backend/commons.py   async client for Commons/Wikidata APIs (search, feed, categ
 backend/sources.py   other collections (Cleveland, iNaturalist, Unsplash, Pexels): search, get by id, items in
                      the Commons shape; `Budget` caps requests per hour for the keyed APIs
 backend/translator.py  local MarianMT Italian -> English
-.env                 UNSPLASH_ACCESS_KEY / PEXELS_API_KEY (git-ignored; template in .env.example)
-backend/curator.py   Claude (claude-opus-5-5) sees a picture, returns doors as structured JSON
+.env                 UNSPLASH_ACCESS_KEY / PEXELS_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY (git-ignored;
+                     template in .env.example)
+backend/curator.py   the curator: GeminiCurator (gemini-3.8-flash, free AI Studio key), LocalCurator (Ollama,
+                     qwen3-vl:8b-instruct, free) or Curator (Claude, paid);
+                     same prompt and JSON schema, sees a picture and returns doors
 backend/embedder.py  DINOv2 (visual, 768-d) + OpenCLIP ViT-B-32 (semantic, 512-d), batched, L2-normalised;
                      `regions`: an image's parts from DINOv2 patch tokens (k-means + connected blobs)
 backend/main.py      FastAPI: /api/flow, /api/foryou, /api/feed, /api/search, /api/file, /api/page, /api/concepts,
@@ -109,21 +112,29 @@ here, with the crop that led to each step (stored in sessionStorage with the ste
 ## Flow (`POST /api/flow {title, via}`)
 
 1. Curator (`curator.py`): the picture (1024 px JPEG, in memory) + the concept that led here + the
-   concepts already met (`flow_memory()["seen"]`, never lead back). Claude Opus 5.5, effort medium,
-   structured output (`SCHEMA`): `seeing` + 5 doors {anchor, box, leap ∈ dentro/perché/altrove/
-   storia/scala, title, wikipedia_it/en, hook, image_query}. `fallbacks: "default"` (beta
-   `server-side-fallback-2026-07-01`) re-runs a declined request on Anthropic's fallback model.
+   concepts already met (`flow_memory()["seen"]`, never lead back), structured output (`SCHEMA`):
+   `seeing` + 5 doors {anchor, box, leap ∈ dentro/perché/altrove/storia/scala, title,
+   wikipedia_it/en, hook, image_query}. Engine chosen at startup: `GeminiCurator` when
+   `GEMINI_API_KEY` is set (Interactions API, `store: false`, `thinking_level` = `GEMINI_THINKING`, default medium:
+   ~30 s and the richest doors, low ~9 s and more obvious ones; `response_format`
+   = the JSON schema; free tier, Google may use the requests); else `LocalCurator` when Ollama
+   (`OLLAMA_URL`, default 127.0.0.1:11434) serves `OLLAMA_MODEL` (default `qwen3-vl:8b-instruct`; Ollama's
+   `format` = the JSON schema, `think: false`), free and on this Mac; else Claude Opus 5.5 with
+   `ANTHROPIC_API_KEY` (effort medium, `fallbacks: "default"`). Boxes are normalised (Qwen answers
+   in thousandths). Run Ollama with `ollama serve` before the backend.
 2. `ground`: a door is kept only if its Wikipedia article exists (Italian first, not a
-   disambiguation); the extract shown is Wikipedia's, the hook is the curator's one line.
+   disambiguation). Inexact titles (local models) go through Wikipedia search; the first hit counts
+   only if it carries most of the asked words. The extract shown is Wikipedia's, the hook is the
+   curator's one line.
 3. `door_pictures`: the article's lead image + Commons "Quality images" search + all Commons (+
    Unsplash/Pexels with keys) for image_query, then the English title, then a shorter query, until 8
-   candidates. Embedded, kept if CLIP relevance ≥ best − 0.05 and beauty ≥ PLAIN, not like a picture
+   candidates. Embedded, kept if CLIP relevance ≥ best − 0.05 and ≥ 0.19 (`CLIP_FLOOR`; the lead
+   image is exempt) and beauty ≥ PLAIN, not like a picture
    already shown on the journey (DINOv2 > 0.85, last 200) nor taken by another door; ranked by
    relevance + beauty + 0.02 for curated.
 4. `farthest`: the door scrolling takes = lowest CLIP text similarity to the concepts met, +0.05 for
    altrove/scala. The frontend prefetches it.
-Without a key the doors are `/api/concepts`' Wikimedia concepts of the image's DINOv2 parts.
-Cost with a key: one Opus call per picture (~3k tokens in, ~3k out with thinking).
+Without a curator the doors are `/api/concepts`' Wikimedia concepts of the image's DINOv2 parts.
 
 ## Concepts: what a detail is (`/api/concepts`, `/api/concept`)
 

@@ -31,7 +31,7 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient, models
 
 from .commons import Commons
-from .curator import Curator
+from .curator import Curator, GeminiCurator, LocalCurator
 from .sources import Cleveland, INaturalist, Pexels, RateLimited, Unsplash
 from .translator import Translator
 from .embedder import SEMANTIC_DIM, VISUAL_DIM, Embedder
@@ -172,9 +172,21 @@ async def lifespan(_: FastAPI):
     aesthetic(np.zeros((1, SEMANTIC_DIM), dtype=np.float32))  # encode the beauty prompts once
     S["commons"] = Commons()
     S["sources"] = make_sources(S["commons"])
-    key = load_env().get("ANTHROPIC_API_KEY")
-    S["curator"] = Curator(key) if key else None
-    log.info("curator: %s", "Claude (%s)" % S["curator"].model if key else "off, no ANTHROPIC_API_KEY: Wikimedia concepts only")
+    # The curator: Gemini with a free AI Studio key, else the free local model when Ollama runs it,
+    # else Claude with a key, else none.
+    env = load_env()
+    local = LocalCurator(env.get("OLLAMA_URL", "http://127.0.0.1:11434"), env.get("OLLAMA_MODEL", "qwen3-vl:8b-instruct"))
+    if env.get("GEMINI_API_KEY"):
+        S["curator"] = GeminiCurator(env["GEMINI_API_KEY"], env.get("GEMINI_MODEL", "gemini-3.8-flash"),
+                                       env.get("GEMINI_THINKING", "medium"))
+    elif await local.available():
+        S["curator"] = local
+    elif env.get("ANTHROPIC_API_KEY"):
+        S["curator"] = Curator(env["ANTHROPIC_API_KEY"])
+    else:
+        S["curator"] = None
+    log.info("curator: %s", f"{type(S['curator']).__name__} ({S['curator'].model})" if S["curator"] else
+             "off (no GEMINI_API_KEY, no Ollama model, no ANTHROPIC_API_KEY): Wikimedia concepts only")
     log.info("sources: Wikimedia Commons, %s", ", ".join(src.label for src in S["sources"].values()))
     client = QdrantClient(path=str(DB_PATH))
     if not client.collection_exists(COLLECTION):
@@ -209,7 +221,9 @@ def load_env() -> dict:
             key, sep, value = line.strip().partition("=")
             if sep and not key.startswith("#"):
                 env[key.strip()] = value.strip().strip("'\"")
-    env.update({k: v for k, v in os.environ.items() if k in ("UNSPLASH_ACCESS_KEY", "PEXELS_API_KEY", "ANTHROPIC_API_KEY")})
+    env.update({k: v for k, v in os.environ.items()
+                if k in ("UNSPLASH_ACCESS_KEY", "PEXELS_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GEMINI_MODEL",
+                         "GEMINI_THINKING", "OLLAMA_URL", "OLLAMA_MODEL")})
     return env
 
 
@@ -1114,7 +1128,8 @@ def commons_file(url: Optional[str]) -> Optional[str]:
 async def door_pictures(queries: list[str], taken: set, lead: Optional[str] = None) -> list[dict]:
     """The best pictures of a concept: curated Commons first (Quality images), then all of Commons and
     the keyed photo libraries, plus the lead image of its Wikipedia article; the next query is tried
-    while there are too few. Kept only if CLIP finds the concept in them (against the first query),
+    while there are too few. Kept only if CLIP finds the concept in them (against the first query, at
+    least CLIP_FLOOR unless it is the article's lead image),
     ranked by relevance and beauty, never a picture like one already shown on this journey or taken
     by another door."""
     commons: Commons = S["commons"]
@@ -1155,7 +1170,10 @@ async def door_pictures(queries: list[str], taken: set, lead: Optional[str] = No
     rel = sem @ text_vector(query)
     quality = aesthetic(sem)
     score = rel + AESTH_SEARCH * beauty(quality) + np.asarray([FLOW_CURATED if c["title"] in curated else 0.0 for c in cands])
-    ok = (rel >= rel.max() - FLOW_SPREAD) & (quality >= PLAIN)
+    # Relative to the best, and never below the floor (a stained-glass roundel for Murray's law scored
+    # 0.15): the article's own lead image is exempt, it is the concept by definition.
+    is_lead = np.asarray([c["title"] == lead_file for c in cands])
+    ok = (((rel >= rel.max() - FLOW_SPREAD) & (rel >= CLIP_FLOOR)) | is_lead) & (quality >= PLAIN)
     looks = flow_memory()["looks"]
     if looks:
         ok &= np.max(vis @ np.stack(looks).T, axis=1) <= FLOW_SAME_LOOK
@@ -1169,17 +1187,36 @@ async def door_pictures(queries: list[str], taken: set, lead: Optional[str] = No
     return [cands[i] for i in picked]
 
 
+def same_words(a: str, b: str) -> bool:
+    """Whether a search hit is the article that was meant: the two titles share most of their words
+    both ways ("Lente a immersione" is not "Sonno a onde lente", "Goccia d'acqua" not "Come una goccia d'acqua")."""
+    wa = set(re.findall(r"\w{3,}", a.lower()))
+    wb = set(re.findall(r"\w{3,}", b.lower()))
+    return bool(wa) and len(wa & wb) / len(wa | wb) >= 0.6
+
+
 async def wikipedia(it_title: str, en_title: str) -> Optional[dict]:
-    """The Wikipedia summary of a concept, Italian first; None if neither article exists."""
+    """The Wikipedia summary of a concept, Italian first; None if neither article exists. A title
+    that is not exact (local models get them slightly wrong) is looked up with Wikipedia's search,
+    and the first hit is accepted only if it carries most of the asked words."""
+    commons: Commons = S["commons"]
     for lang, title in (("it", it_title), ("en", en_title)):
         if not title:
             continue
+        candidates = [title]
         try:
-            sm = await S["commons"].summary(lang, title)
-        except Exception:  # noqa: BLE001 - no such article
-            continue
-        if sm.get("extract") and sm.get("kind") != "disambiguation":
-            return {"lang": lang, "about": title, **sm}
+            hits = await commons._get(f"https://{lang}.wikipedia.org/w/api.php", action="query", list="search",
+                                      srsearch=title, srlimit=1, srnamespace=0)
+            candidates += [h["title"] for h in (hits.get("query") or {}).get("search", []) if same_words(title, h["title"])]
+        except Exception:  # noqa: BLE001
+            pass
+        for t in dict.fromkeys(candidates):
+            try:
+                sm = await commons.summary(lang, t)
+            except Exception:  # noqa: BLE001 - no such article
+                continue
+            if sm.get("extract") and sm.get("kind") != "disambiguation" and not PLACE_OR_WORK.search(sm.get("description", "")):
+                return {"lang": lang, "about": t, **sm}
     return None
 
 
@@ -1265,14 +1302,19 @@ async def flow(step: FlowStep):
             seeing = data.get("seeing") or ""
             taken = {step.title}
             grounded = await asyncio.gather(*(ground(d, taken) for d in data.get("doors", [])[:7]))
-            doors = [d for d in grounded if d]
+            doors = list({d["about"]: d for d in reversed([d for d in grounded if d])}.values())[::-1]  # one door per article
+            if isinstance(curator, LocalCurator):
+                # A small local model picks good details and concepts but invents facts in its hooks:
+                # the line shown is Wikipedia's own first sentence instead.
+                for d in doors:
+                    d["hook"] = re.split(r"(?<=[.!?])\s", d["extract"], maxsplit=1)[0]
     if not doors:
         seeing, doors = await wikimedia_doors(step.title)
     nxt = await asyncio.to_thread(farthest, doors)
     mem["seen"].extend(d["title"] for d in doors)
     del mem["seen"][:-200]
     result = {"item": with_saved_flag([item])[0], "seeing": seeing, "doors": doors, "next": nxt,
-              "curator": bool(curator)}
+              "curator": type(curator).__name__ if curator else None}
     cache[step.title] = result
     while len(cache) > FLOW_CACHED:
         cache.popitem(last=False)

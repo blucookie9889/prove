@@ -422,6 +422,7 @@ class Commons:
         data = await self._get(f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{path}")
         return {
             "kind": data.get("type") or "",  # "disambiguation" pages explain nothing
+            "description": data.get("description") or "",  # Wikidata's short description
             "extract": data.get("extract") or "",
             "image": (data.get("originalimage") or data.get("thumbnail") or {}).get("source"),
             "url": ((data.get("content_urls") or {}).get("desktop") or {}).get("page"),
