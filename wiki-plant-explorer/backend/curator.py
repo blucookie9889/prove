@@ -23,7 +23,8 @@ import base64
 import io
 import json
 import logging
-from typing import Optional
+import re
+from typing import AsyncIterator, Optional
 
 import anthropic
 import httpx
@@ -110,15 +111,99 @@ def context_text(name: str, via: Optional[str], seen: list[str]) -> str:
     return "\n".join(lines)
 
 
+def normalise_door(d: dict) -> dict:
+    """Box as fractions: some models answer in thousandths (Qwen-VL, Gemini) or pixels of the 1024 px image."""
+    box = [float(d.get(k) or 0) for k in ("x0", "y0", "x1", "y1")]
+    top = max(box)
+    scale = 1.0 if top <= 1.5 else 1000.0 if top <= 1000 else float(SIDE)
+    x0, y0, x1, y1 = (v / scale for v in box)
+    d.update(x0=min(x0, x1), y0=min(y0, y1), x1=max(x0, x1), y1=max(y0, y1))
+    return d
+
+
 def normalise(data: dict) -> dict:
-    """Boxes as fractions: some models answer in thousandths (Qwen-VL) or pixels of the 1024 px image."""
     for d in data.get("doors", []):
-        box = [float(d.get(k) or 0) for k in ("x0", "y0", "x1", "y1")]
-        top = max(box)
-        scale = 1.0 if top <= 1.5 else 1000.0 if top <= 1000 else float(SIDE)
-        x0, y0, x1, y1 = (v / scale for v in box)
-        d.update(x0=min(x0, x1), y0=min(y0, y1), x1=max(x0, x1), y1=max(y0, y1))
+        normalise_door(d)
     return data
+
+
+class AnswerStream:
+    """Reads the curator's JSON while it is being written: the "seeing" sentence as it grows, and each
+    door as soon as its object closes, so the caller can show and ground them before the end."""
+
+    SEEING = re.compile(r'"seeing"\s*:\s*"')
+    DOORS = re.compile(r'"doors"\s*:\s*\[')
+
+    def __init__(self):
+        self.text = ""
+        self.seeing = ""
+        self.pos = -1  # scan position inside the doors array
+        self.depth = 0
+        self.start = -1
+        self.in_string = False
+        self.escape = False
+
+    def feed(self, chunk: str) -> list[tuple[str, object]]:
+        self.text += chunk
+        events: list[tuple[str, object]] = []
+        m = self.SEEING.search(self.text)
+        if m and self.pos < 0:
+            raw = re.match(r'(?:[^"\\]|\\.)*', self.text[m.end():]).group(0)
+            try:
+                seeing = json.loads('"' + raw.rstrip("\\") + '"')
+            except ValueError:
+                seeing = self.seeing
+            if seeing != self.seeing:
+                self.seeing = seeing
+                events.append(("seeing", seeing))
+        if self.pos < 0:
+            m = self.DOORS.search(self.text)
+            if not m:
+                return events
+            self.pos = m.end()
+        text = self.text
+        while self.pos < len(text):
+            ch = text[self.pos]
+            if self.in_string:
+                if self.escape:
+                    self.escape = False
+                elif ch == "\\":
+                    self.escape = True
+                elif ch == '"':
+                    self.in_string = False
+            elif ch == '"':
+                self.in_string = True
+            elif ch == "{":
+                if self.depth == 0:
+                    self.start = self.pos
+                self.depth += 1
+            elif ch == "}":
+                self.depth -= 1
+                if self.depth == 0 and self.start >= 0:
+                    try:
+                        events.append(("door", normalise_door(json.loads(text[self.start:self.pos + 1]))))
+                    except ValueError:
+                        pass
+                    self.start = -1
+            self.pos += 1
+        return events
+
+
+class Engine:
+    async def doors(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
+                    deep: bool = True) -> Optional[dict]:
+        raise NotImplementedError
+
+    async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
+                     deep: bool = True) -> AsyncIterator[tuple[str, object]]:
+        """("seeing", text) and ("door", door) as they become known. Engines that cannot stream
+        give everything at once at the end."""
+        data = await self.doors(image, name, via, seen, deep=deep)
+        if not data:
+            return
+        yield "seeing", data.get("seeing") or ""
+        for d in data.get("doors", []):
+            yield "door", d
 
 
 def jpeg_b64(image: Image.Image) -> str:
@@ -129,7 +214,7 @@ def jpeg_b64(image: Image.Image) -> str:
     return base64.standard_b64encode(buf.getvalue()).decode()
 
 
-class Curator:
+class Curator(Engine):
     def __init__(self, api_key: str, model: str = MODEL):
         self.client = anthropic.AsyncAnthropic(api_key=api_key)
         self.model = model
@@ -179,7 +264,7 @@ class Curator:
         return normalise(data)
 
 
-class LocalCurator:
+class LocalCurator(Engine):
     """The same curator on an open vision-language model served by Ollama on this Mac: free."""
 
     def __init__(self, url: str, model: str):
@@ -219,7 +304,7 @@ class LocalCurator:
         return normalise(data)
 
 
-class GeminiCurator:
+class GeminiCurator(Engine):
     """The same curator on Google Gemini through the Interactions API: free with an AI Studio key."""
 
     URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
@@ -229,11 +314,12 @@ class GeminiCurator:
         self.thinking = thinking  # medium: 30-70 s and the richest doors; low: ~9 s, more obvious doors
         self.http = httpx.AsyncClient(timeout=120, headers={"x-goog-api-key": api_key})
 
-    async def doors(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
-                    deep: bool = True) -> Optional[dict]:
+    async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
+                     deep: bool = True) -> AsyncIterator[tuple[str, object]]:
         body = {
             "model": self.model,
             "store": False,
+            "stream": True,
             "system_instruction": SYSTEM,
             "input": [
                 {"type": "image", "data": jpeg_b64(image), "mime_type": "image/jpeg"},
@@ -242,24 +328,33 @@ class GeminiCurator:
             "response_format": {"type": "text", "mime_type": "application/json", "schema": SCHEMA},
             "generation_config": {"thinking_level": self.thinking if deep else "low"},  # low while someone waits
         }
+        answer = AnswerStream()
+        usage: dict = {}
         try:
-            resp = await self.http.post(self.URL, json=body)
+            async with self.http.stream("POST", self.URL, json=body) as resp:
+                if resp.status_code != 200:
+                    text = (await resp.aread()).decode(errors="replace")
+                    level = log.error if resp.status_code in (400, 401, 403) else log.warning
+                    level("gemini curator: HTTP %s for %s: %s", resp.status_code, name, text[:300])
+                    return
+                # Server-sent events: "data: {...}" lines; the text arrives in step.delta events.
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        ev = json.loads(line[5:])
+                    except ValueError:
+                        continue  # "[DONE]"
+                    kind = ev.get("event_type")
+                    if kind == "step.delta" and (ev.get("delta") or {}).get("type") == "text":
+                        for event in answer.feed(ev["delta"].get("text", "")):
+                            yield event
+                    elif kind == "interaction.completed":
+                        usage = (ev.get("interaction") or {}).get("usage") or {}
+                    elif kind == "error":
+                        log.warning("gemini curator: error for %s: %s", name, str(ev)[:300])
         except httpx.HTTPError as exc:
             log.warning("gemini curator: connection error: %s", exc)
-            return None
-        if resp.status_code != 200:
-            level = log.error if resp.status_code in (400, 401, 403) else log.warning
-            level("gemini curator: HTTP %s for %s: %s", resp.status_code, name, resp.text[:300])
-            return None
-        reply = resp.json()
-        text = "".join(c.get("text", "") for step in reply.get("steps", []) if step.get("type") == "model_output"
-                       for c in step.get("content", []) if c.get("type") == "text")
-        try:
-            data = json.loads(text)
-        except ValueError:
-            log.warning("gemini curator: unreadable answer for %s (status: %s)", name, reply.get("status"))
-            return None
-        usage = reply.get("usage") or {}
-        log.info("gemini curator %s: %s in / %s out / %s thinking tokens", name, usage.get("total_input_tokens"),
-                 usage.get("total_output_tokens"), usage.get("total_thought_tokens"))
-        return normalise(data)
+            return
+        log.info("gemini curator %s: %s in / %s out / %s thinking tokens%s", name, usage.get("total_input_tokens"),
+                 usage.get("total_output_tokens"), usage.get("total_thought_tokens"), "" if deep else " (quick)")

@@ -27,6 +27,7 @@ from typing import Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from qdrant_client import QdrantClient, models
 
@@ -1128,7 +1129,7 @@ def commons_file(url: Optional[str]) -> Optional[str]:
 async def door_pictures(queries: list[str], taken: set, lead: Optional[str] = None) -> list[dict]:
     """The best pictures of a concept: curated Commons first (Quality images), then all of Commons and
     the keyed photo libraries, plus the lead image of its Wikipedia article; the next query is tried
-    while there are too few. Kept only if CLIP finds the concept in them (against the first query, at
+    while there are too few, or none fits. Kept only if CLIP finds the concept in them (against the first query, at
     least CLIP_FLOOR unless it is the article's lead image),
     ranked by relevance and beauty, never a picture like one already shown on this journey or taken
     by another door."""
@@ -1150,41 +1151,58 @@ async def door_pictures(queries: list[str], taken: set, lead: Optional[str] = No
             add(await commons.files([lead_file]), True)
         except Exception:  # noqa: BLE001
             pass
-    for query in [q for q in dict.fromkeys(queries) if q]:
+
+    async def search(query: str) -> None:
         jobs = [commons.search(query, limit=8, curated=True), commons.search(query, limit=6)]
         jobs += [src.search(query, limit=4) for key, src in S["sources"].items() if key in ("unsplash", "pexels")]
         for n, r in enumerate(await asyncio.gather(*jobs, return_exceptions=True)):
             if not isinstance(r, Exception):
                 add(r[0], n == 0)
-        if len(cands) >= 8:
-            break
-    if not cands:
-        return []
-    query = queries[0]
-    vecs, _ = await ensure_vectors(cands, new_budget=len(cands))
-    cands = [c for c in cands if c["title"] in vecs]
-    if not cands:
-        return []
-    sem = np.stack([vecs[c["title"]]["semantic"] for c in cands])
-    vis = np.stack([vecs[c["title"]]["visual"] for c in cands])
-    rel = sem @ text_vector(query)
-    quality = aesthetic(sem)
-    score = rel + AESTH_SEARCH * beauty(quality) + np.asarray([FLOW_CURATED if c["title"] in curated else 0.0 for c in cands])
-    # Relative to the best, and never below the floor (a stained-glass roundel for Murray's law scored
-    # 0.15): the article's own lead image is exempt, it is the concept by definition.
-    is_lead = np.asarray([c["title"] == lead_file for c in cands])
-    ok = (((rel >= rel.max() - FLOW_SPREAD) & (rel >= CLIP_FLOOR)) | is_lead) & (quality >= PLAIN)
-    looks = flow_memory()["looks"]
-    if looks:
-        ok &= np.max(vis @ np.stack(looks).T, axis=1) <= FLOW_SAME_LOOK
-    picked: list[int] = []
-    for i in np.argsort(-score):
-        if not ok[i] or (picked and float(np.max(vis[picked] @ vis[i])) > NEAR_DUP):
+
+    async def pick() -> list[dict]:
+        vecs, _ = await ensure_vectors(cands, new_budget=len(cands))
+        known = [c for c in cands if c["title"] in vecs]
+        if not known:
+            return []
+        sem = np.stack([vecs[c["title"]]["semantic"] for c in known])
+        vis = np.stack([vecs[c["title"]]["visual"] for c in known])
+        rel = sem @ text_vector(queries[0])
+        quality = aesthetic(sem)
+        score = rel + AESTH_SEARCH * beauty(quality) + np.asarray([FLOW_CURATED if c["title"] in curated else 0.0 for c in known])
+        # Usable: good enough to look at and not like a picture already shown. Then relevant: close to
+        # the best usable one (a diagram that matches better must not shut out a fine photograph), and
+        # never below the floor (a stained-glass roundel for Murray's law scored 0.15). The article's own
+        # lead image is exempt from relevance: it is the concept by definition.
+        usable = quality >= PLAIN
+        looks = flow_memory()["looks"]
+        if looks:
+            usable &= np.max(vis @ np.stack(looks).T, axis=1) <= FLOW_SAME_LOOK
+        is_lead = np.asarray([c["title"] == lead_file for c in known])
+        best = float(rel[usable].max()) if usable.any() else 1.0
+        ok = usable & (((rel >= best - FLOW_SPREAD) & (rel >= CLIP_FLOOR)) | is_lead)
+        if not ok.any():
+            log.info("flow pictures %r: none of %d fits (best relevance %.3f, best usable %.3f, %d usable)",
+                     queries[0], len(known), float(rel.max()), best if usable.any() else 0.0, int(usable.sum()))
+        picked: list[int] = []
+        for i in np.argsort(-score):
+            if not ok[i] or (picked and float(np.max(vis[picked] @ vis[i])) > NEAR_DUP):
+                continue
+            picked.append(int(i))
+            if len(picked) == 4:
+                break
+        return [known[i] for i in picked]
+
+    # Searches in turn: the next one while there are too few candidates, or while none of them fits.
+    pics: list[dict] = []
+    pending = [q for q in dict.fromkeys(queries) if q]
+    while pending:
+        await search(pending.pop(0))
+        if len(cands) < 8 and pending:
             continue
-        picked.append(int(i))
-        if len(picked) == 4:
+        pics = await pick() if cands else []
+        if pics:
             break
-    return [cands[i] for i in picked]
+    return pics
 
 
 def same_words(a: str, b: str) -> bool:
@@ -1203,42 +1221,58 @@ async def wikipedia(it_title: str, en_title: str) -> Optional[dict]:
     for lang, title in (("it", it_title), ("en", en_title)):
         if not title:
             continue
-        candidates = [title]
-        try:
-            hits = await commons._get(f"https://{lang}.wikipedia.org/w/api.php", action="query", list="search",
-                                      srsearch=title, srlimit=1, srnamespace=0)
-            candidates += [h["title"] for h in (hits.get("query") or {}).get("search", []) if same_words(title, h["title"])]
-        except Exception:  # noqa: BLE001
-            pass
-        for t in dict.fromkeys(candidates):
+        # The exact title and the search at the same time: one round trip when the title is right.
+        exact, hits = await asyncio.gather(
+            commons.summary(lang, title),
+            commons._get(f"https://{lang}.wikipedia.org/w/api.php", action="query", list="search",
+                         srsearch=title, srlimit=1, srnamespace=0),
+            return_exceptions=True)
+        if fits(exact):
+            return {"lang": lang, "about": title, **exact}
+        if isinstance(hits, Exception):
+            continue
+        for h in (hits.get("query") or {}).get("search", []):
+            if h["title"] == title or not same_words(title, h["title"]):
+                continue
             try:
-                sm = await commons.summary(lang, t)
+                sm = await commons.summary(lang, h["title"])
             except Exception:  # noqa: BLE001 - no such article
                 continue
-            if sm.get("extract") and sm.get("kind") != "disambiguation" and not PLACE_OR_WORK.search(sm.get("description", "")):
-                return {"lang": lang, "about": t, **sm}
+            if fits(sm):
+                return {"lang": lang, "about": h["title"], **sm}
     return None
 
 
-async def ground(door: dict, taken: set) -> Optional[dict]:
-    """A curator's door, kept only if Wikipedia has its article and a fitting picture exists."""
+def fits(sm) -> bool:
+    """A summary that explains a concept: not an error, not a disambiguation, not a place or a work."""
+    return isinstance(sm, dict) and bool(sm.get("extract")) and sm.get("kind") != "disambiguation" \
+        and not PLACE_OR_WORK.search(sm.get("description", ""))
+
+
+async def ground_article(door: dict) -> Optional[dict]:
+    """A curator's door with its Wikipedia article (text only), or None when there is no article."""
     art = await wikipedia(door["wikipedia_it"], door["wikipedia_en"])
     if not art:
         log.info("flow: dropped %r (no article)", door["title"])
         return None
-    short = " ".join(door["image_query"].split()[:2])
-    pics = await door_pictures([door["image_query"], door["wikipedia_en"], short], taken, art.get("image"))
-    if not pics:
-        log.info("flow: dropped %r (%s)", door["title"], "no article" if not art else "no picture")
-        return None
-    taken.update(p["title"] for p in pics)
     box = [min(1.0, max(0.0, float(door[k]))) for k in ("x0", "y0", "x1", "y1")]
     return {
         "anchor": door["anchor"], "box": box, "dot": [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2],
         "leap": door["leap"], "title": door["title"], "hook": door["hook"],
         "about": art["about"], "lang": art["lang"], "extract": art["extract"], "url": art.get("url"),
-        "item": with_saved_flag(pics[:1])[0], "more": pics[1:],
+        "lead": art.get("image"), "query": [door["image_query"], door["wikipedia_en"], " ".join(door["image_query"].split()[:2])],
     }
+
+
+async def ground_pictures(door: dict, taken: set) -> bool:
+    """Gives the door its pictures; False when none fits (the door is then dropped)."""
+    pics = await door_pictures(door.pop("query"), taken, door.pop("lead"))
+    if not pics:
+        log.info("flow: dropped %r (no picture)", door["title"])
+        return False
+    taken.update(p["title"] for p in pics)
+    door.update(item=with_saved_flag(pics[:1])[0], more=pics[1:], ready=True)
+    return True
 
 
 async def wikimedia_doors(title: str) -> tuple[str, list[dict]]:
@@ -1275,61 +1309,168 @@ class FlowStep(BaseModel):
     warm: bool = False  # prepared ahead (the person is not waiting): the curator may think longer
 
 
+class FlowRun:
+    """One picture being worked out: the events so far (item, seeing, door, drop, done), which any
+    number of readers follow as they come. A picture being prepared ahead is followed, never redone."""
+
+    def __init__(self):
+        self.events: list[dict] = []
+        self.done = False
+        self.changed = asyncio.Event()
+
+    def emit(self, event: dict) -> None:
+        self.events.append(event)
+        self.changed.set()
+        self.changed = asyncio.Event()
+
+    async def follow(self):
+        i = 0
+        while True:
+            while i < len(self.events):
+                yield self.events[i]
+                i += 1
+            if self.done:
+                return
+            await self.changed.wait()
+
+    async def result(self) -> dict:
+        async for ev in self.follow():
+            if ev["type"] == "done":
+                return ev["result"]
+        raise HTTPException(500, "Qualcosa è andato storto, riprova.")
+
+
+def flow_run(step: FlowStep) -> FlowRun:
+    runs: dict = S.setdefault("flow_runs", {})
+    run = runs.get(step.title)
+    if run:
+        return run
+    run = runs[step.title] = FlowRun()
+    cache: OrderedDict = S.setdefault("flow_cache", OrderedDict())
+
+    async def work() -> None:
+        try:
+            if step.title in cache:
+                result = cache[step.title]
+                run.emit({"type": "item", "item": result["item"]})
+                run.emit({"type": "seeing", "text": result["seeing"]})
+                for d in result["doors"]:
+                    run.emit({"type": "door", "door": d})
+            else:
+                result = await flow_step(step, run)
+                cache[step.title] = result
+                while len(cache) > FLOW_CACHED:
+                    cache.popitem(last=False)
+            run.emit({"type": "done", "result": result})
+        except HTTPException as exc:
+            run.emit({"type": "error", "detail": exc.detail})
+        except Exception:  # noqa: BLE001
+            log.exception("flow %s failed", step.title)
+            run.emit({"type": "error", "detail": "Qualcosa è andato storto, riprova."})
+        finally:
+            run.done = True
+            run.changed.set()
+            runs.pop(step.title, None)
+
+    asyncio.ensure_future(work())
+    return run
+
+
 @app.post("/api/flow")
 async def flow(step: FlowStep):
     """The doors out of one picture of the stream, and which one to take next if the person just scrolls."""
-    cache: OrderedDict = S.setdefault("flow_cache", OrderedDict())
-    if step.title in cache:
-        return cache[step.title]
-    pending: dict = S.setdefault("flow_pending", {})
-    if step.title not in pending:  # a picture being prepared ahead is awaited, not asked for twice
-        task = asyncio.ensure_future(flow_step(step, cache))
-        pending[step.title] = task
-        task.add_done_callback(lambda _: pending.pop(step.title, None))
-    return await asyncio.shield(pending[step.title])
+    run = flow_run(step)
+    async for ev in run.follow():
+        if ev["type"] == "done":
+            return ev["result"]
+        if ev["type"] == "error":
+            raise HTTPException(500, ev["detail"])
+    raise HTTPException(500, "Qualcosa è andato storto, riprova.")
 
 
-async def flow_step(step: FlowStep, cache: OrderedDict) -> dict:
+@app.post("/api/flow/stream")
+async def flow_stream(step: FlowStep):
+    """The same, as it is worked out: one JSON event per line, so the page shows what the curator sees
+    while it writes, each door once its article is found, and its picture once chosen."""
+    run = flow_run(step)
+
+    async def lines():
+        async for ev in run.follow():
+            yield json.dumps(ev, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(lines(), media_type="application/x-ndjson", headers={"Cache-Control": "no-store"})
+
+
+async def flow_step(step: FlowStep, run: FlowRun) -> dict:
     item = await resolve(step.title)
     if not item:
         raise HTTPException(404, "Immagine non trovata")
-    vecs, _ = await ensure_vectors([item], new_budget=1)
-    if step.title in vecs:
-        remember_look(vecs[step.title]["visual"])
+    run.emit({"type": "item", "item": with_saved_flag([item])[0]})
     mem = flow_memory()
     if step.via:
         mem["seen"].append(step.via)
     t0 = time.time()
-    seeing, doors = "", []
-    curator: Optional[Curator] = S.get("curator")
-    if curator:
+    curator = S.get("curator")
+
+    async def picture():
+        if not curator:
+            return None
         try:
-            image = await S["commons"].fetch_image(large_url(item))
+            return await S["commons"].fetch_image(large_url(item))
         except Exception:  # noqa: BLE001
-            image = await S["commons"].fetch_image(item["thumb"])
-        data = await curator.doors(image, item["name"], step.via, mem["seen"], deep=step.warm)
-        if data:
-            seeing = data.get("seeing") or ""
-            taken = {step.title}
-            grounded = await asyncio.gather(*(ground(d, taken) for d in data.get("doors", [])[:7]))
-            doors = list({d["about"]: d for d in reversed([d for d in grounded if d])}.values())[::-1]  # one door per article
-            if isinstance(curator, LocalCurator):
-                # A small local model picks good details and concepts but invents facts in its hooks:
-                # the line shown is Wikipedia's own first sentence instead.
-                for d in doors:
-                    d["hook"] = re.split(r"(?<=[.!?])\s", d["extract"], maxsplit=1)[0]
+            return await S["commons"].fetch_image(item["thumb"])
+
+    (vecs, _), image = await asyncio.gather(ensure_vectors([item], new_budget=1), picture())
+    if step.title in vecs:
+        remember_look(vecs[step.title]["visual"])
+
+    seeing, doors = "", []  # doors in the order they were shown
+    taken = {step.title}
+    used: set = set()
+
+    async def open_door(raw: dict, ident: int) -> None:
+        door = await ground_article(raw)
+        if not door or door["about"] in used:  # one door per article
+            return
+        used.add(door["about"])
+        if isinstance(curator, LocalCurator):
+            # A small local model picks good details and concepts but invents facts in its hooks:
+            # the line shown is Wikipedia's own first sentence instead.
+            door["hook"] = re.split(r"(?<=[.!?])\s", door["extract"], maxsplit=1)[0]
+        door.update(id=ident, ready=False)
+        doors.append(door)
+        run.emit({"type": "door", "door": {k: v for k, v in door.items() if k not in ("query", "lead")}})
+        try:
+            ok = await ground_pictures(door, taken)
+        except Exception:  # noqa: BLE001
+            log.exception("flow: pictures for %r failed", door["title"])
+            ok = False
+        if ok:
+            run.emit({"type": "door", "door": door})
+        else:
+            doors.remove(door)
+            run.emit({"type": "drop", "id": ident})
+
+    if curator:
+        jobs = []
+        async for kind, value in curator.stream(image, item["name"], step.via, mem["seen"], deep=step.warm):
+            if kind == "seeing":
+                seeing = value
+                run.emit({"type": "seeing", "text": seeing})
+            elif len(jobs) < 7:
+                jobs.append(asyncio.ensure_future(open_door(value, len(jobs))))
+        await asyncio.gather(*jobs, return_exceptions=True)
     if not doors:
         seeing, doors = await wikimedia_doors(step.title)
+        for i, d in enumerate(doors):
+            d.update(id=100 + i, ready=True)
+            run.emit({"type": "door", "door": d})
     nxt = await asyncio.to_thread(farthest, doors)
     mem["seen"].extend(d["title"] for d in doors)
     del mem["seen"][:-200]
-    result = {"item": with_saved_flag([item])[0], "seeing": seeing, "doors": doors, "next": nxt,
-              "curator": type(curator).__name__ if curator else None}
-    cache[step.title] = result
-    while len(cache) > FLOW_CACHED:
-        cache.popitem(last=False)
     log.info("flow %s: %d doors in %.1fs%s", step.title, len(doors), time.time() - t0, " (ahead)" if step.warm else "")
-    return result
+    return {"item": with_saved_flag([item])[0], "seeing": seeing, "doors": doors, "next": nxt,
+            "curator": type(curator).__name__ if curator else None}
 
 
 def interest_seeds() -> list[str]:

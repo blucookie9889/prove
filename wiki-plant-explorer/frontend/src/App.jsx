@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 
 const SUGGESTIONS = ["foglie", "texture", "architettura gotica", "minerali", "conchiglie", "nuvole", "farfalle", "mosaici"];
@@ -178,14 +178,14 @@ function SkeletonGrid({ n = 18 }) {
   );
 }
 
-function InfiniteSentinel({ onVisible, active }) {
+function InfiniteSentinel({ onVisible, active, margin = "1200px" }) {
   const ref = useRef(null);
   useEffect(() => {
     if (!active || !ref.current) return undefined;
-    const io = new IntersectionObserver((e) => e[0].isIntersecting && onVisible(), { rootMargin: "1200px" });
+    const io = new IntersectionObserver((e) => e[0].isIntersecting && onVisible(), { rootMargin: margin });
     io.observe(ref.current);
     return () => io.disconnect();
-  }, [active, onVisible]);
+  }, [active, onVisible, margin]);
   return <div ref={ref} className="h-px" />;
 }
 
@@ -399,6 +399,31 @@ function Browse({ route, cardHandlers }) {
 
 /* ------------------------------------------------------------------ flow */
 
+/** POST that answers one JSON event per line; ``onEvent`` gets each as it arrives. */
+async function apiStream(path, body, onEvent, signal) {
+  const res = await fetch(`/api${path}`, {
+    method: "POST",
+    signal,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok || !res.body) throw new Error("Qualcosa è andato storto, riprova.");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    lines.filter(Boolean).forEach((l) => onEvent(JSON.parse(l)));
+  }
+}
+
+const reduceMotion = () => window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const wide = () => window.matchMedia("(min-width: 1024px)").matches;
+
 /**
  * The veil over a picture that leaves one box clear: four paper-coloured rectangles around it.
  * ``box`` is x0, y0, x1, y1 as fractions of the picture.
@@ -414,69 +439,228 @@ function Veil({ box }) {
   return (
     <span className={`pointer-events-none absolute inset-0 transition-opacity duration-[1200ms] ease-[cubic-bezier(.16,1,.3,1)] ${box ? "opacity-100" : "opacity-0"}`}>
       {parts.map((st, i) => (
-        <span key={i} className="absolute bg-paper/70" style={st} />
+        <span key={i} className="absolute bg-paper/75 transition-all duration-[900ms] ease-[cubic-bezier(.16,1,.3,1)]" style={st} />
       ))}
     </span>
   );
 }
 
-/** One picture of the stream, its doors marked on it: hover one to see where it starts. */
-function FlowPicture({ item, doors, hover, setHover, onFollow }) {
+/**
+ * A hairline from a detail of the picture to the door it opens, drawn in when either is hovered.
+ * Only side by side (wide screens): stacked, the list is right under the picture.
+ */
+function Connector({ host, from, to, on }) {
+  const [path, setPath] = useState(null);
+  useLayoutEffect(() => {
+    if (!on || !host.current || !from || !to || !wide()) {
+      setPath(null);
+      return;
+    }
+    const h = host.current.getBoundingClientRect();
+    const a = from.getBoundingClientRect();
+    const b = to.getBoundingClientRect();
+    const x1 = a.left + a.width / 2 - h.left;
+    const y1 = a.top + a.height / 2 - h.top;
+    const x2 = b.left - h.left - 12;
+    const y2 = b.top + b.height / 2 - h.top;
+    if (x2 <= x1) {
+      setPath(null);
+      return;
+    }
+    const dx = (x2 - x1) * 0.5;
+    setPath({ d: `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`, x2, y2 });
+  }, [on, host, from, to]);
+  if (!path) return null;
+  return (
+    <svg className="pointer-events-none absolute inset-0 z-10 h-full w-full overflow-visible" aria-hidden="true">
+      {/* a paper halo under the ink line keeps it readable over dark pictures */}
+      <path key={`h${path.d}`} d={path.d} pathLength="1" className="draw text-paper/80" fill="none" stroke="currentColor" strokeWidth="3" />
+      <path key={path.d} d={path.d} pathLength="1" className="draw text-ink/70" fill="none" stroke="currentColor" strokeWidth="1" />
+      <circle key={`c${path.d}`} cx={path.x2} cy={path.y2} r="2" className="fade-in fill-ink/70" />
+    </svg>
+  );
+}
+
+/**
+ * The picture of a spread with its doors marked on it. As large as the screen allows, never cropped.
+ * Under it, what the curator sees in it (written as it looks) and the credits.
+ */
+function FlowPicture({ item, seeing, doors, hover, setHover, onFollow, dotRefs, name, showName }) {
   const [bigLoaded, setBigLoaded] = useState(false);
   const ratio = item?.width && item?.height ? item.width / item.height : 4 / 3;
   const big = bigThumb(item);
   return (
-    <div className="relative mx-auto" style={{ aspectRatio: `${ratio}`, width: `min(100%, calc(80vh * ${ratio}))` }}>
-      <div className="placeholder absolute inset-0 overflow-hidden rounded-[2px]">
-        {item?.thumb && (
-          <>
-            <img src={item.thumb} alt={item.name} className="h-full w-full object-cover" />
-            <img
-              src={big}
-              alt=""
-              onLoad={() => setBigLoaded(true)}
-              className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-[1800ms] ease-[cubic-bezier(.16,1,.3,1)] ${bigLoaded ? "opacity-100" : "opacity-0"}`}
-            />
-          </>
-        )}
-        <Veil box={hover >= 0 && doors?.[hover] ? doors[hover].box : null} />
+    <figure className="flex min-w-0 flex-col items-center">
+      <div
+        className="relative w-[min(100%,calc(68svh*var(--r)))] lg:w-[min(100%,calc((100svh-210px)*var(--r)))]"
+        style={{ "--r": ratio, aspectRatio: `${ratio}`, viewTransitionName: name }}
+      >
+        <div className="placeholder absolute inset-0 overflow-hidden rounded-[2px]">
+          {item?.thumb && (
+            <>
+              <img src={item.thumb} alt={item.name} className="h-full w-full object-cover" />
+              <img
+                src={big}
+                alt=""
+                onLoad={() => setBigLoaded(true)}
+                className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-[1800ms] ease-[cubic-bezier(.16,1,.3,1)] ${bigLoaded ? "opacity-100" : "opacity-0"}`}
+              />
+            </>
+          )}
+          <Veil box={hover >= 0 && doors?.[hover] ? doors[hover].box : null} />
+        </div>
         {(doors || []).map((d, i) => (
           <button
-            key={i}
+            key={d.id}
+            ref={(el) => (dotRefs.current[i] = el)}
             type="button"
             aria-label={d.title}
+            disabled={!d.ready}
             onMouseEnter={() => setHover(i)}
             onMouseLeave={() => setHover(-1)}
             onFocus={() => setHover(i)}
             onBlur={() => setHover(-1)}
             onClick={() => onFollow(i)}
-            className="fade-in absolute grid h-8 w-8 -translate-x-1/2 -translate-y-1/2 place-items-center"
-            style={{ left: `${d.dot[0] * 100}%`, top: `${d.dot[1] * 100}%`, animationDelay: `${0.3 + i * 0.25}s` }}
+            className="fade-in absolute z-20 grid h-9 w-9 -translate-x-1/2 -translate-y-1/2 place-items-center"
+            style={{ left: `${d.dot[0] * 100}%`, top: `${d.dot[1] * 100}%` }}
           >
             <span
-              className={`block h-1.5 w-1.5 rounded-full bg-paper outline outline-1 outline-ink/25 transition-transform duration-[1200ms] ease-[cubic-bezier(.16,1,.3,1)] ${
-                hover === i ? "scale-[1.8]" : "breathe"
+              className={`block h-2 w-2 rounded-full bg-paper outline outline-1 outline-ink/30 transition-[transform,opacity] duration-[1200ms] ease-[cubic-bezier(.16,1,.3,1)] ${
+                hover === i ? "scale-[1.7] opacity-100" : d.ready ? "breathe" : "opacity-50"
               }`}
               style={{ animationDelay: `${i * 0.7}s` }}
             />
           </button>
         ))}
       </div>
+      <figcaption className="mt-3 flex w-[min(100%,calc(68svh*var(--r)))] flex-col gap-1 lg:w-[min(100%,calc((100svh-210px)*var(--r)))]" style={{ "--r": ratio }}>
+        {seeing ? <p className="text-ink-2">{seeing}</p> : null}
+        <p className="truncate text-mute">{[showName ? item?.name : null, item?.author, item?.license].filter(Boolean).join(" · ")}</p>
+      </figcaption>
+    </figure>
+  );
+}
+
+/** Wikipedia's explanation, a few lines, the rest a click away. */
+function Extract({ text }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  const [long, setLong] = useState(false);
+  useLayoutEffect(() => {
+    if (ref.current) setLong(ref.current.scrollHeight > ref.current.clientHeight + 2);
+  }, [text]);
+  return (
+    <div className="rise rise-3 text-ink-2">
+      <p ref={ref} className={open ? "" : "line-clamp-4"}>
+        {text}
+      </p>
+      {(long || open) && (
+        <button type="button" onClick={() => setOpen((o) => !o)} className="link mt-1 text-mute">
+          {open ? "meno" : "continua"}
+        </button>
+      )}
     </div>
   );
 }
 
-/**
- * One stimulus: the door that led here (what it is, the hook, Wikipedia's explanation), the
- * picture, and the doors out of it as list rows.
- */
-function Stimulus({ entry, first, onFollow, cardHandlers }) {
-  const [hover, setHover] = useState(-1);
-  const { item, via, data } = entry;
-  const doors = data?.doors;
+/** One door of the list: what it leads to and from which detail; the picture it opens on the left. */
+function DoorRow({ door, n, isNext, hover, onHover, onFollow, thumbRef }) {
+  const dim = hover >= 0 && hover !== n;
   return (
-    <section id={entry.key} className="mb-40 scroll-mt-24">
-      <div className="mx-auto mb-12 flex max-w-[560px] flex-col gap-3.5">
+    <div className="rise">
+    <button
+      type="button"
+      data-door={n}
+      disabled={!door.ready}
+      onClick={(e) => onFollow(n, e.currentTarget.querySelector("img"))}
+      onMouseEnter={() => onHover(n)}
+      onMouseLeave={() => onHover(-1)}
+      onFocus={() => onHover(n)}
+      onBlur={() => onHover(-1)}
+      className={`group grid w-full grid-cols-[52px_1fr] gap-4 border-t border-rule py-3 text-left transition-opacity duration-[1200ms] ease-[cubic-bezier(.16,1,.3,1)] disabled:cursor-default ${
+        dim ? "opacity-[.38]" : "opacity-100"
+      }`}
+    >
+      <span ref={thumbRef} className="placeholder relative block aspect-[4/5] w-[52px] overflow-hidden rounded-[2px]">
+        {door.ready ? (
+          <img src={door.item.thumb} alt="" className="fade-in h-full w-full object-cover" />
+        ) : (
+          <span className="breathe absolute inset-0 bg-rule-2" />
+        )}
+      </span>
+      <span className="calm min-w-0 transition-transform group-enabled:group-hover:translate-x-[3px]">
+        <span className="flex gap-2 text-mute">
+          <span>{n + 1}</span>
+          <span className="min-w-0 truncate">
+            {door.leap}
+            {door.anchor ? ` · ${door.anchor}` : ""}
+          </span>
+          {isNext && (
+            <span className="ml-auto shrink-0" title="Scorrendo si apre questa">
+              ↓
+            </span>
+          )}
+        </span>
+        <span className={`block transition-colors duration-[1200ms] first-letter:uppercase ${door.ready ? "text-ink" : "text-mute"}`}>{door.title}</span>
+        <span className="line-clamp-2 block text-ink-2">{door.hook}</span>
+      </span>
+    </button>
+    </div>
+  );
+}
+
+/** Rows standing in for doors not found yet. */
+function DoorSkeleton({ n }) {
+  return Array.from({ length: n }, (_, i) => (
+    <div key={i} className="fade-in grid grid-cols-[52px_1fr] gap-4 border-t border-rule py-3" style={{ animationDelay: `${i * 0.2}s` }}>
+      <span className="placeholder block aspect-[4/5] w-[52px] rounded-[2px]" />
+      <span className="flex flex-col gap-2 pt-1.5">
+        <span className="breathe block h-2 w-24 rounded-full bg-rule-2" style={{ animationDelay: `${i * 0.5}s` }} />
+        <span className="breathe block h-2 w-40 rounded-full bg-rule-2" style={{ animationDelay: `${i * 0.5 + 0.2}s` }} />
+      </span>
+    </div>
+  ));
+}
+
+/**
+ * One stimulus as a spread: the picture on the left, on the right the concept that led here
+ * (its hook, Wikipedia's explanation) and the doors out of it. A door and its detail answer each
+ * other: hovering one clears the detail, draws the line to it and lets the other doors recede.
+ */
+function Stimulus({ entry, first, active, dive, onFollow, onSave, sectionRef }) {
+  const [hover, setHover] = useState(-1);
+  const host = useRef(null);
+  const dotRefs = useRef([]);
+  const thumbRefs = useRef([]);
+  const { item, via, data } = entry;
+  const doors = data?.doors || [];
+  const done = Boolean(data?.done);
+  const follow = (i, from) => onFollow(i, from || thumbRefs.current[i]?.querySelector("img"));
+  useEffect(() => {
+    sectionRef(host.current);
+    return () => sectionRef(null);
+  }, [sectionRef]);
+  return (
+    <section
+      id={entry.key}
+      ref={host}
+      className="relative grid scroll-mt-16 grid-cols-1 content-center gap-x-16 gap-y-10 py-10 lg:min-h-[calc(100svh-64px)] lg:grid-cols-[minmax(0,1fr)_minmax(320px,400px)] lg:py-8"
+    >
+      <div className={`lg:sticky lg:top-[88px] lg:self-start ${first ? "fade-in" : "rise rise-1"}`}>
+        <FlowPicture
+          item={item}
+          seeing={data?.seeing}
+          doors={doors}
+          hover={hover}
+          setHover={setHover}
+          onFollow={(i) => follow(i, dotRefs.current[i])}
+          dotRefs={dotRefs}
+          name={dive ? "dive" : first ? vtName(entry.title) : undefined}
+          showName={Boolean(via)}
+        />
+      </div>
+
+      <aside className="flex min-w-0 flex-col gap-3.5 self-center lg:min-h-[calc(100svh-210px)] lg:justify-center lg:py-6">
         {via ? (
           <>
             <p className="rise rise-1 text-mute">
@@ -485,100 +669,89 @@ function Stimulus({ entry, first, onFollow, cardHandlers }) {
             </p>
             <h2 className="rise rise-1 first-letter:uppercase">{via.title}</h2>
             <p className="rise rise-2">{via.hook}</p>
-          </>
-        ) : (
-          <>
-            <h1 className="rise rise-1">{item?.name || " "}</h1>
-            {item?.author !== undefined && <p className="rise rise-1 text-mute">{[item.author, item.license].filter(Boolean).join(" · ")}</p>}
-            {data?.seeing && <p className="rise rise-2 text-ink-2">{data.seeing}</p>}
-          </>
-        )}
-      </div>
-
-      <div className={first ? "rise rise-2" : "rise rise-3"}>
-        <FlowPicture item={item} doors={doors} hover={hover} setHover={setHover} onFollow={(i) => onFollow(i)} />
-      </div>
-
-      <div className="mx-auto mt-12 flex max-w-[560px] flex-col gap-3.5">
-        {via?.extract && (
-          <>
-            <p className="text-ink-2">{via.extract}</p>
-            <p className="flex flex-wrap gap-x-5 text-mute">
+            {via.extract && <Extract text={via.extract} />}
+            <p className="rise rise-3 flex flex-wrap gap-x-5 text-mute">
               {via.url && (
                 <a href={via.url} target="_blank" rel="noreferrer">
                   Wikipedia{via.lang === "en" ? ", in inglese" : ""}
                 </a>
               )}
-              <button type="button" onClick={() => cardHandlers.onSave(item)} className="link">
-                {item.saved ? "Salvata" : "Salva"}
-              </button>
-              <span className="truncate">{item.name}</span>
+              {item && (
+                <button type="button" onClick={() => onSave(item)} className="link">
+                  {item.saved ? "Salvata" : "Salva"}
+                </button>
+              )}
             </p>
           </>
-        )}
-        {!via && item && (
-          <p className="flex flex-wrap gap-x-5 text-mute">
-            <button type="button" onClick={() => cardHandlers.onSave(item)} className="link">
-              {item.saved ? "Salvata" : "Salva"}
-            </button>
-            {item.page_url && (
-              <a href={item.page_url} target="_blank" rel="noreferrer">
-                {item.source || "Wikimedia Commons"}
-              </a>
+        ) : (
+          <>
+            <h1 className="rise rise-1">{item?.name || " "}</h1>
+            {item && (
+              <p className="rise rise-2 flex flex-wrap gap-x-5 text-mute">
+                <button type="button" onClick={() => onSave(item)} className="link">
+                  {item.saved ? "Salvata" : "Salva"}
+                </button>
+                {item.page_url && (
+                  <a href={item.page_url} target="_blank" rel="noreferrer">
+                    {item.source || "Wikimedia Commons"}
+                  </a>
+                )}
+              </p>
             )}
-          </p>
+          </>
         )}
 
-        <div className="mt-10 flex flex-col">
-          <p className="mb-3.5 text-mute">Da qui</p>
-          {!data ? (
-            <p className="border-t border-rule py-[11px]">
-              <Breathing>Guardo cosa c'è di interessante</Breathing>
-            </p>
-          ) : !doors.length ? (
-            <p className="border-t border-rule py-[11px] text-mute">Nessuna porta da questa immagine.</p>
-          ) : (
-            <div className="recede flex flex-col">
-              {doors.map((d, i) => (
-                <button
-                  key={i}
-                  type="button"
-                  onClick={() => onFollow(i)}
-                  onMouseEnter={() => setHover(i)}
-                  onMouseLeave={() => setHover(-1)}
-                  className="rise group grid grid-cols-[108px_1fr_48px] items-start gap-x-0 border-t border-rule py-[11px] text-left"
-                  style={{ "--i": i * 3 }}
-                >
-                  <span className="text-mute">{d.leap}</span>
-                  <span className="calm min-w-0 pr-4 transition-transform group-hover:translate-x-[3px]">
-                    <span className="block first-letter:uppercase">{d.title}</span>
-                    <span className="block text-ink-2">{d.hook}</span>
-                  </span>
-                  <img src={d.item.thumb} alt="" loading="lazy" className="aspect-[4/5] w-12 rounded-[2px] bg-wash object-cover" />
-                </button>
-              ))}
-              <div className="border-t border-rule" />
-            </div>
-          )}
-          {data && !data.curator && (
-            <p className="mt-3.5 text-mute">Porte dai concetti di Wikimedia. Con una chiave Anthropic in .env le sceglie il curatore.</p>
+        <div className="mt-6 flex flex-col">
+          <p className="mb-2.5 flex items-baseline justify-between gap-4 text-mute">
+            <span>Da qui</span>
+            {!done ? (
+              <Breathing>{data?.seeing ? "Cerco le porte" : "Guardo cosa c'è di interessante"}</Breathing>
+            ) : (
+              doors.length > 0 && active && <span className="hidden lg:inline">1–{doors.length} per aprire</span>
+            )}
+          </p>
+          <div className="flex flex-col">
+            {doors.map((d, i) => (
+              <DoorRow
+                key={d.id}
+                door={d}
+                n={i}
+                isNext={done && data.next === i}
+                hover={hover}
+                onHover={setHover}
+                onFollow={follow}
+                thumbRef={(el) => (thumbRefs.current[i] = el)}
+              />
+            ))}
+            {!done && <DoorSkeleton n={Math.max(0, 3 - doors.length)} />}
+            {done && !doors.length && <p className="border-t border-rule py-3 text-mute">{data.error || "Nessuna porta da questa immagine."}</p>}
+            <div className="border-t border-rule" />
+          </div>
+          {done && !data.curator && doors.length > 0 && (
+            <p className="mt-3.5 text-mute">Porte dai concetti di Wikimedia: con una chiave Gemini in .env le sceglie il curatore.</p>
           )}
         </div>
-      </div>
+      </aside>
+
+      <Connector host={host} from={dotRefs.current[hover]} to={thumbRefs.current[hover]} on={hover >= 0} />
     </section>
   );
 }
 
 /**
- * The stream: a picture, the doors out of it, and on and on. Scrolling takes the door farthest
- * from where the person has been; clicking a door (in the list or on the picture) takes that one.
+ * The stream: a picture, the doors out of it, and on and on. Each picture's doors arrive as the
+ * curator finds them. Scrolling takes the door farthest from where the person has been; clicking a
+ * door (in the list or on the picture, or its number on the keyboard) dives into it.
  * There is no trail to keep: only what comes next.
  */
 function Flow({ route, preview, cardHandlers }) {
   const [stream, setStream] = useState(() => [
     { key: `s0-${route.file}`, title: route.file, item: preview?.title === route.file ? preview : null, via: null, data: null },
   ]);
-  const asked = useRef(new Set());
+  const [dive, setDive] = useState(null);
+  const [active, setActive] = useState(0);
+  const asked = useRef(new Map()); // entry key -> AbortController of its stream
+  const sections = useRef(new Map());
   const count = useRef(1);
 
   useEffect(() => {
@@ -588,51 +761,165 @@ function Flow({ route, preview, cardHandlers }) {
     return () => window.removeEventListener("saved-changed", onSaved);
   }, []);
 
-  // Ask for the doors of every picture that has none yet (quickly: the person is waiting); prepare the
-  // one scrolling would take next ahead, with time to think.
+  useEffect(
+    () => () => {
+      asked.current.forEach((c) => c.abort());
+      asked.current.clear();
+    },
+    [],
+  );
+
+  // Stream the doors of every picture that has none yet (quickly: the person is waiting); once they
+  // are all there, prepare the one scrolling would take next, with time to think.
   useEffect(() => {
+    const keys = new Set(stream.map((e) => e.key));
+    asked.current.forEach((c, k) => {
+      if (!keys.has(k)) {
+        c.abort();
+        asked.current.delete(k);
+      }
+    });
     stream.forEach((e) => {
-      if (e.data || asked.current.has(e.key)) return;
-      asked.current.add(e.key);
-      api("/flow", { body: { title: e.title, via: e.via?.title || null } })
-        .then((d) => {
-          setStream((prev) => prev.map((p) => (p.key === e.key ? { ...p, item: { ...p.item, ...d.item }, data: d } : p)));
-          const nd = d.doors[d.next];
-          if (nd) api("/flow", { body: { title: nd.item.title, via: nd.title, warm: true } }).catch(() => {});
-        })
-        .catch(() => setStream((prev) => prev.map((p) => (p.key === e.key ? { ...p, data: { doors: [], next: -1 } } : p))));
+      if (e.data?.done || asked.current.has(e.key)) return;
+      const ctrl = new AbortController();
+      asked.current.set(e.key, ctrl);
+      const patch = (fn) => setStream((prev) => prev.map((p) => (p.key === e.key ? fn(p) : p)));
+      const withData = (p, fn) => ({ ...p, data: fn(p.data || { seeing: "", doors: [], next: -1, done: false }) });
+      apiStream(
+        "/flow/stream",
+        { title: e.title, via: e.via?.title || null },
+        (ev) => {
+          if (ev.type === "item") patch((p) => ({ ...p, item: { ...p.item, ...ev.item } }));
+          else if (ev.type === "seeing") patch((p) => withData(p, (d) => ({ ...d, seeing: ev.text })));
+          else if (ev.type === "door")
+            patch((p) =>
+              withData(p, (d) => {
+                const at = d.doors.findIndex((x) => x.id === ev.door.id);
+                const doors = at < 0 ? [...d.doors, ev.door] : d.doors.map((x, i) => (i === at ? ev.door : x));
+                return { ...d, doors };
+              }),
+            );
+          else if (ev.type === "drop") patch((p) => withData(p, (d) => ({ ...d, doors: d.doors.filter((x) => x.id !== ev.id) })));
+          else if (ev.type === "error") patch((p) => withData(p, (d) => ({ ...d, done: true, error: ev.detail })));
+          else if (ev.type === "done") {
+            const r = ev.result;
+            patch((p) => ({ ...p, item: { ...p.item, ...r.item }, data: { ...r, done: true } }));
+            const nd = r.doors[r.next];
+            if (nd) api("/flow", { body: { title: nd.item.title, via: nd.title, warm: true } }).catch(() => {});
+          }
+        },
+        ctrl.signal,
+      ).catch((err) => {
+        if (err.name !== "AbortError") patch((p) => withData(p, (d) => ({ ...d, done: true, error: "Il server non risponde, riprova." })));
+      });
     });
   }, [stream]);
+
+  // The spread in view is the one the keyboard speaks to.
+  useEffect(() => {
+    const io = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((en) => {
+          if (en.isIntersecting) setActive(Number(en.target.dataset.index));
+        });
+      },
+      { rootMargin: "-45% 0px -45% 0px" },
+    );
+    const frame = requestAnimationFrame(() =>
+      sections.current.forEach((el, i) => {
+        el.dataset.index = i;
+        io.observe(el);
+      }),
+    );
+    return () => {
+      cancelAnimationFrame(frame);
+      io.disconnect();
+    };
+  }, [stream.length]);
 
   const step = (door) => {
     count.current += 1;
     return { key: `s${count.current}-${door.item.title}`, title: door.item.title, item: door.item, via: door, data: null };
   };
 
-  const follow = (index, doorIndex) => {
-    const door = stream[index].data?.doors?.[doorIndex];
-    if (!door) return;
+  // Following a door: its little picture grows into the next spread (a View Transition named "dive").
+  const current = useRef(stream);
+  current.current = stream;
+  const follow = useCallback((index, doorIndex, fromEl) => {
+    const door = current.current[index]?.data?.doors?.[doorIndex];
+    if (!door?.ready) return;
     const next = step(door);
-    setStream((prev) => [...prev.slice(0, index + 1), next]);
+    const show = (prev) => [...prev.slice(0, index + 1), next];
     window.history.replaceState(null, "", routeUrl({ view: "flow", file: next.title }));
-    requestAnimationFrame(() => document.getElementById(next.key)?.scrollIntoView({ behavior: "smooth" }));
+    if (!document.startViewTransition || reduceMotion() || !fromEl) {
+      setStream(show);
+      requestAnimationFrame(() => document.getElementById(next.key)?.scrollIntoView({ behavior: reduceMotion() ? "auto" : "smooth" }));
+      return;
+    }
+    fromEl.style.viewTransitionName = "dive";
+    const t = document.startViewTransition(() => {
+      fromEl.style.viewTransitionName = "";
+      flushSync(() => {
+        setDive(next.key);
+        setStream(show);
+      });
+      document.getElementById(next.key)?.scrollIntoView({ block: "start" });
+    });
+    t.finished.finally(() => setDive(null));
+  }, []);
+
+  // Keys: 1-9 open that door of the spread in view, → the one scrolling would take.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey || /input|textarea|select/i.test(e.target.tagName)) return;
+      const entry = stream[active];
+      if (!entry?.data) return;
+      if (/^[1-9]$/.test(e.key)) {
+        const i = Number(e.key) - 1;
+        if (entry.data.doors[i]?.ready) {
+          e.preventDefault();
+          follow(active, i, sections.current.get(active)?.querySelector(`[data-door="${i}"] img`));
+        }
+      } else if (e.key === "ArrowRight" && entry.data.done && entry.data.next >= 0) {
+        e.preventDefault();
+        follow(active, entry.data.next, null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [stream, active, follow]);
+
+  const refSetters = useRef(new Map());
+  const sectionRef = (i) => {
+    if (!refSetters.current.has(i))
+      refSetters.current.set(i, (el) => (el ? sections.current.set(i, el) : sections.current.delete(i)));
+    return refSetters.current.get(i);
   };
 
   const last = stream[stream.length - 1];
   const more = useCallback(() => {
     setStream((prev) => {
       const tail = prev[prev.length - 1];
-      const door = tail.data?.doors?.[tail.data.next];
+      const door = tail.data?.done && tail.data.doors?.[tail.data.next];
       return door ? [...prev, step(door)] : prev;
     });
   }, []);
 
   return (
-    <main className="mx-auto max-w-[1500px] px-6 pt-16 pb-12 md:pt-24">
+    <main className="mx-auto max-w-[1500px] px-6 pb-12">
       {stream.map((e, i) => (
-        <Stimulus key={e.key} entry={e} first={i === 0} onFollow={(d) => follow(i, d)} cardHandlers={cardHandlers} />
+        <Stimulus
+          key={e.key}
+          entry={e}
+          first={i === 0}
+          active={i === active}
+          dive={dive === e.key}
+          onFollow={(d, from) => follow(i, d, from)}
+          onSave={cardHandlers.onSave}
+          sectionRef={sectionRef(i)}
+        />
       ))}
-      <InfiniteSentinel onVisible={more} active={Boolean(last.data && last.data.next >= 0)} />
+      <InfiniteSentinel onVisible={more} active={Boolean(last.data?.done && last.data.next >= 0)} margin="160px" />
     </main>
   );
 }

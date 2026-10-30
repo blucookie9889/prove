@@ -123,6 +123,21 @@ a:hover,
   50% { opacity: 0.2; }
 }
 
+/* A hairline drawing itself in (SVG paths with pathLength="1") */
+.draw {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: draw 0.9s var(--ease-calm) forwards;
+}
+@keyframes draw {
+  to { stroke-dashoffset: 0; }
+}
+
+/* Diving into a door: its little picture grows into the next spread */
+::view-transition-group(dive) {
+  animation-duration: 1.2s;
+}
+
 /* Expand / collapse rows */
 .fold {
   display: grid;
@@ -207,6 +222,7 @@ input::placeholder {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .rise, .fade-in, .breathe { animation: none; }
+  .rise, .fade-in, .breathe, .draw { animation: none; }
+  .draw { stroke-dashoffset: 0; }
   .fold, .fold > div > *, .recede > *, .plus::after, a, .link { transition: none; }
 }

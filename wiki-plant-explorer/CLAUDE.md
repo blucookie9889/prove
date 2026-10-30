@@ -25,10 +25,10 @@ backend/translator.py  local MarianMT Italian -> English
                      template in .env.example)
 backend/curator.py   the curator: GeminiCurator (gemini-3.8-flash, free AI Studio key), LocalCurator (Ollama,
                      qwen3-vl:8b-instruct, free) or Curator (Claude, paid);
-                     same prompt and JSON schema, sees a picture and returns doors
+                     same prompt and JSON schema, sees a picture and streams doors
 backend/embedder.py  DINOv2 (visual, 768-d) + OpenCLIP ViT-B-32 (semantic, 512-d), batched, L2-normalised;
                      `regions`: an image's parts from DINOv2 patch tokens (k-means + connected blobs)
-backend/main.py      FastAPI: /api/flow, /api/foryou, /api/feed, /api/search, /api/file, /api/page, /api/concepts,
+backend/main.py      FastAPI: /api/flow(/stream), /api/foryou, /api/feed, /api/search, /api/file, /api/page, /api/concepts,
                      /api/concept, /api/similar, /api/vote,
                      /api/view, /api/saved, /api/health; background crawler
 frontend/            React 19 + Vite 6 + Tailwind 4, white image-first UI; Vite proxies /api to the backend
@@ -109,34 +109,52 @@ Transition grows it into the next image ("dive"). On touch, a first tap previews
 "In questa immagine" lists every link: the crop, then its targets. The trail at the top is the way
 here, with the crop that led to each step (stored in sessionStorage with the step).
 
-## Flow (`POST /api/flow {title, via}`)
+## Flow (`POST /api/flow/stream {title, via}`; `POST /api/flow` = the same, whole)
+
+Each picture is a `FlowRun`: events (`item`, `seeing`, `door`, `drop`, `done` with the whole result,
+`error`) that any number of readers follow as they come. `/api/flow/stream` sends them as NDJSON, one
+per line; `/api/flow` waits for `done` (used to prepare the next picture ahead, `warm: true`). A
+picture being worked out is followed, never asked for twice; finished ones are cached (64).
 
 1. Curator (`curator.py`): the picture (1024 px JPEG, in memory) + the concept that led here + the
    concepts already met (`flow_memory()["seen"]`, never lead back), structured output (`SCHEMA`):
    `seeing` + 5 doors {anchor, box, leap ∈ dentro/perché/altrove/storia/scala, title,
-   wikipedia_it/en, hook, image_query}. Engine chosen at startup: `GeminiCurator` when
-   `GEMINI_API_KEY` is set (Interactions API, `store: false`, `thinking_level` = `GEMINI_THINKING`, default medium:
-   30-70 s and the richest doors, low ~9 s and more obvious ones; a picture the person is
-   waiting for always uses low, the next one prepared ahead (`warm`) uses `GEMINI_THINKING`; `response_format`
-   = the JSON schema; free tier, Google may use the requests); else `LocalCurator` when Ollama
-   (`OLLAMA_URL`, default 127.0.0.1:11434) serves `OLLAMA_MODEL` (default `qwen3-vl:8b-instruct`; Ollama's
-   `format` = the JSON schema, `think: false`), free and on this Mac; else Claude Opus 5.5 with
-   `ANTHROPIC_API_KEY` (effort medium, `fallbacks: "default"`). Boxes are normalised (Qwen answers
-   in thousandths). Run Ollama with `ollama serve` before the backend.
-2. `ground`: a door is kept only if its Wikipedia article exists (Italian first, not a
-   disambiguation). Inexact titles (local models) go through Wikipedia search; the first hit counts
-   only if it carries most of the asked words. The extract shown is Wikipedia's, the hook is the
-   curator's one line.
-3. `door_pictures`: the article's lead image + Commons "Quality images" search + all Commons (+
-   Unsplash/Pexels with keys) for image_query, then the English title, then a shorter query, until 8
-   candidates. Embedded, kept if CLIP relevance ≥ best − 0.05 and ≥ 0.19 (`CLIP_FLOOR`; the lead
-   image is exempt) and beauty ≥ PLAIN, not like a picture
-   already shown on the journey (DINOv2 > 0.85, last 200) nor taken by another door; ranked by
-   relevance + beauty + 0.02 for curated.
-   A picture already being prepared is awaited, never asked for twice (`flow_pending`).
+   wikipedia_it/en, hook, image_query}. `Engine.stream` yields ("seeing", text) and ("door", door)
+   as they become known. Engine chosen at startup: `GeminiCurator` when `GEMINI_API_KEY` is set
+   (Interactions API with `stream: true`, server-sent `step.delta` text read by `AnswerStream` as it
+   is written; `store: false`; `response_format` = the JSON schema; free tier, Google may use the
+   requests). Its `thinking_level` is low while the person waits (~9 s) and `GEMINI_THINKING`
+   (default medium, 30-70 s, richest doors) for the picture prepared ahead. Else `LocalCurator` when
+   Ollama (`OLLAMA_URL`, default 127.0.0.1:11434) serves `OLLAMA_MODEL` (default
+   `qwen3-vl:8b-instruct`; `format` = the JSON schema, `think: false`), free and on this Mac; else
+   Claude Opus 5.5 with `ANTHROPIC_API_KEY` (effort medium, `fallbacks: "default"`). These two answer
+   whole. Boxes are normalised (Qwen and Gemini answer in thousandths). Run Ollama with `ollama serve`
+   before the backend.
+2. Each door is grounded as soon as it closes in the stream. `ground_article`: kept only if its
+   Wikipedia article exists (Italian first, not a disambiguation, not a place or work); the exact
+   title and Wikipedia search are asked at once, and a search hit counts only if it carries most of
+   the asked words. One door per article. The door is sent now (`ready: false`: text and dot only).
+   The extract shown is Wikipedia's, the hook is the curator's one line.
+3. `ground_pictures` → `door_pictures`: the article's lead image + Commons "Quality images" search +
+   all Commons (+ Unsplash/Pexels with keys) for image_query, then the English title, then a shorter
+   query, while there are fewer than 8 candidates or none fits. Embedded; usable = beauty ≥ PLAIN and not like a picture already shown; kept if CLIP relevance ≥
+   best usable − 0.05 and ≥ 0.19 (`CLIP_FLOOR`; the lead image is exempt); "already shown" = DINOv2 > 0.85 to the last 200
+   pictures of the journey; never one taken by another door; ranked
+   by relevance + beauty + 0.02 for curated. Then the door is sent again `ready`, or `drop`ped.
 4. `farthest`: the door scrolling takes = lowest CLIP text similarity to the concepts met, +0.05 for
-   altrove/scala. The frontend prefetches it.
+   altrove/scala. The frontend prepares it ahead once the picture is done.
 Without a curator the doors are `/api/concepts`' Wikimedia concepts of the image's DINOv2 parts.
+Timing with Gemini: picture at once, `seeing` ~3 s, first door ~4-5 s, all ~10-12 s.
+
+Frontend (`Flow`, `Stimulus` in App.jsx): each picture is a spread, the picture on the left (sticky,
+as large as the screen allows, with what the curator sees and the credits under it) and on the right
+the concept that led here (leap · detail, title, hook, Wikipedia's extract clamped) and "Da qui": the
+doors as rows (thumbnail, number, leap · detail, title, hook; ↓ marks the one scrolling takes;
+skeleton rows while they arrive). A door and its dot answer each other on hover: the veil clears its
+detail, a hairline (`Connector`, wide screens only) draws itself from the dot to the row, the other
+rows recede. Clicking dives in: the row's thumbnail grows into the next spread (View Transition
+`dive`). Keys: 1-9 open that door of the spread in view, → the one scrolling would take. The next
+spread is added when the end is within 160 px, so pictures are not worked out in a cascade.
 
 ## Concepts: what a detail is (`/api/concepts`, `/api/concept`)
 
