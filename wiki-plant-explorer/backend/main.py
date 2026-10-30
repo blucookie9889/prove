@@ -1272,6 +1272,7 @@ def farthest(doors: list[dict]) -> int:
 class FlowStep(BaseModel):
     title: str  # the picture
     via: Optional[str] = None  # the concept that led to it
+    warm: bool = False  # prepared ahead (the person is not waiting): the curator may think longer
 
 
 @app.post("/api/flow")
@@ -1280,6 +1281,15 @@ async def flow(step: FlowStep):
     cache: OrderedDict = S.setdefault("flow_cache", OrderedDict())
     if step.title in cache:
         return cache[step.title]
+    pending: dict = S.setdefault("flow_pending", {})
+    if step.title not in pending:  # a picture being prepared ahead is awaited, not asked for twice
+        task = asyncio.ensure_future(flow_step(step, cache))
+        pending[step.title] = task
+        task.add_done_callback(lambda _: pending.pop(step.title, None))
+    return await asyncio.shield(pending[step.title])
+
+
+async def flow_step(step: FlowStep, cache: OrderedDict) -> dict:
     item = await resolve(step.title)
     if not item:
         raise HTTPException(404, "Immagine non trovata")
@@ -1297,7 +1307,7 @@ async def flow(step: FlowStep):
             image = await S["commons"].fetch_image(large_url(item))
         except Exception:  # noqa: BLE001
             image = await S["commons"].fetch_image(item["thumb"])
-        data = await curator.doors(image, item["name"], step.via, mem["seen"])
+        data = await curator.doors(image, item["name"], step.via, mem["seen"], deep=step.warm)
         if data:
             seeing = data.get("seeing") or ""
             taken = {step.title}
@@ -1318,7 +1328,7 @@ async def flow(step: FlowStep):
     cache[step.title] = result
     while len(cache) > FLOW_CACHED:
         cache.popitem(last=False)
-    log.info("flow %s: %d doors in %.1fs", step.title, len(doors), time.time() - t0)
+    log.info("flow %s: %d doors in %.1fs%s", step.title, len(doors), time.time() - t0, " (ahead)" if step.warm else "")
     return result
 
 

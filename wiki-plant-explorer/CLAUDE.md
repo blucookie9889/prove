@@ -116,7 +116,8 @@ here, with the crop that led to each step (stored in sessionStorage with the ste
    `seeing` + 5 doors {anchor, box, leap ∈ dentro/perché/altrove/storia/scala, title,
    wikipedia_it/en, hook, image_query}. Engine chosen at startup: `GeminiCurator` when
    `GEMINI_API_KEY` is set (Interactions API, `store: false`, `thinking_level` = `GEMINI_THINKING`, default medium:
-   ~30 s and the richest doors, low ~9 s and more obvious ones; `response_format`
+   30-70 s and the richest doors, low ~9 s and more obvious ones; a picture the person is
+   waiting for always uses low, the next one prepared ahead (`warm`) uses `GEMINI_THINKING`; `response_format`
    = the JSON schema; free tier, Google may use the requests); else `LocalCurator` when Ollama
    (`OLLAMA_URL`, default 127.0.0.1:11434) serves `OLLAMA_MODEL` (default `qwen3-vl:8b-instruct`; Ollama's
    `format` = the JSON schema, `think: false`), free and on this Mac; else Claude Opus 5.5 with
@@ -132,6 +133,7 @@ here, with the crop that led to each step (stored in sessionStorage with the ste
    image is exempt) and beauty ≥ PLAIN, not like a picture
    already shown on the journey (DINOv2 > 0.85, last 200) nor taken by another door; ranked by
    relevance + beauty + 0.02 for curated.
+   A picture already being prepared is awaited, never asked for twice (`flow_pending`).
 4. `farthest`: the door scrolling takes = lowest CLIP text similarity to the concepts met, +0.05 for
    altrove/scala. The frontend prefetches it.
 Without a curator the doors are `/api/concepts`' Wikimedia concepts of the image's DINOv2 parts.

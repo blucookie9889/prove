@@ -588,7 +588,8 @@ function Flow({ route, preview, cardHandlers }) {
     return () => window.removeEventListener("saved-changed", onSaved);
   }, []);
 
-  // Ask for the doors of every picture that has none yet; warm up the one scrolling would take next.
+  // Ask for the doors of every picture that has none yet (quickly: the person is waiting); prepare the
+  // one scrolling would take next ahead, with time to think.
   useEffect(() => {
     stream.forEach((e) => {
       if (e.data || asked.current.has(e.key)) return;
@@ -597,7 +598,7 @@ function Flow({ route, preview, cardHandlers }) {
         .then((d) => {
           setStream((prev) => prev.map((p) => (p.key === e.key ? { ...p, item: { ...p.item, ...d.item }, data: d } : p)));
           const nd = d.doors[d.next];
-          if (nd) api("/flow", { body: { title: nd.item.title, via: nd.title } }).catch(() => {});
+          if (nd) api("/flow", { body: { title: nd.item.title, via: nd.title, warm: true } }).catch(() => {});
         })
         .catch(() => setStream((prev) => prev.map((p) => (p.key === e.key ? { ...p, data: { doors: [], next: -1 } } : p))));
     });

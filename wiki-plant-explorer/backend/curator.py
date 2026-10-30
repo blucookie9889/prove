@@ -134,8 +134,10 @@ class Curator:
         self.client = anthropic.AsyncAnthropic(api_key=api_key)
         self.model = model
 
-    async def doors(self, image: Image.Image, name: str, via: Optional[str], seen: list[str]) -> Optional[dict]:
-        """{"seeing", "doors": [...]} for ``image``, or None when the model declines or fails."""
+    async def doors(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
+                    deep: bool = True) -> Optional[dict]:
+        """{"seeing", "doors": [...]} for ``image``, or None when the model declines or fails. ``deep``: the
+        picture is prepared ahead, so the model may think longer (only Gemini tells the two apart)."""
         try:
             response = await self.client.beta.messages.create(
                 model=self.model,
@@ -192,7 +194,8 @@ class LocalCurator:
             return False
         return any(m.get("name") == self.model or m.get("model") == self.model for m in tags.get("models", []))
 
-    async def doors(self, image: Image.Image, name: str, via: Optional[str], seen: list[str]) -> Optional[dict]:
+    async def doors(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
+                    deep: bool = True) -> Optional[dict]:
         body = {
             "model": self.model,
             "stream": False,
@@ -223,10 +226,11 @@ class GeminiCurator:
 
     def __init__(self, api_key: str, model: str, thinking: str = "medium"):
         self.model = model
-        self.thinking = thinking  # medium: ~30 s and the richest doors; low: ~9 s, more obvious doors
+        self.thinking = thinking  # medium: 30-70 s and the richest doors; low: ~9 s, more obvious doors
         self.http = httpx.AsyncClient(timeout=120, headers={"x-goog-api-key": api_key})
 
-    async def doors(self, image: Image.Image, name: str, via: Optional[str], seen: list[str]) -> Optional[dict]:
+    async def doors(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
+                    deep: bool = True) -> Optional[dict]:
         body = {
             "model": self.model,
             "store": False,
@@ -236,7 +240,7 @@ class GeminiCurator:
                 {"type": "text", "text": context_text(name, via, seen)},
             ],
             "response_format": {"type": "text", "mime_type": "application/json", "schema": SCHEMA},
-            "generation_config": {"thinking_level": self.thinking},
+            "generation_config": {"thinking_level": self.thinking if deep else "low"},  # low while someone waits
         }
         try:
             resp = await self.http.post(self.URL, json=body)
