@@ -1,0 +1,180 @@
+/* Wiki Explorer's look: warm paper, Geist at one size, two tones, hairlines, slow eased motion.
+   Wide hero: the browser inset top and left, running off the right and the bottom. */
+.wx {
+  --paper: #faf9f6;
+  --ink: #1d1c1a;
+  --ink-2: #55534d;
+  --mute: #a19e97;
+  --rule: #eeece7;
+  --calm: cubic-bezier(0.16, 1, 0.3, 1);
+
+  & .ss-stage {
+    --gutter: 32px;
+    overflow: hidden;
+    border-radius: 14px;
+    background: var(--ss-well);
+    font-family: Geist, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  }
+
+  .wx-window {
+    position: absolute;
+    top: var(--gutter);
+    left: var(--gutter);
+    width: 900px;
+    height: 600px;
+    box-shadow: var(--ss-shadow-hero);
+  }
+
+  .wx-app {
+    height: 100%;
+    background: var(--paper);
+    color: var(--ink);
+    font-size: 14px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wx-header {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+    height: 48px;
+    padding: 0 24px;
+    font-size: 14px;
+  }
+
+  .wx-search {
+    flex: 1;
+    padding-bottom: 6px;
+    margin-top: 6px;
+    color: var(--mute);
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .wx-spread {
+    display: grid;
+    grid-template-columns: 460px 300px;
+    gap: 36px;
+    padding: 20px 24px 0;
+  }
+
+  .wx-figure { margin: 0; }
+
+  .wx-picture {
+    position: relative;
+    width: 460px;
+    height: 345px;
+    overflow: hidden;
+    background: #e9e6df;
+
+    & img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  }
+
+  /* The detail's box stays bright; the rest of the picture goes under a paper veil */
+  .wx-hole {
+    position: absolute;
+    box-shadow: 0 0 0 999px rgb(250 249 246 / 0.7);
+    outline: 1px solid rgb(255 255 255 / 0.85);
+    opacity: 0;
+    transition: opacity 0.7s var(--calm);
+    &[data-show='true'] { opacity: 1; }
+  }
+
+  .wx-dot {
+    position: absolute;
+    width: 14px;
+    height: 14px;
+    margin: -7px 0 0 -7px;
+    border-radius: 50%;
+    border: 1.5px solid #fff;
+    background: rgb(255 255 255 / 0.22);
+    box-shadow: 0 0 0 1px rgb(0 0 0 / 0.12), 0 1px 4px rgb(0 0 0 / 0.25);
+    opacity: 0;
+    transform: scale(0.6);
+    transition: opacity 0.6s var(--calm), transform 0.6s var(--calm), background-color 0.4s var(--calm);
+    &[data-show='true'] { opacity: 1; transform: none; }
+    &[data-on='true'] { background: #fff; transform: scale(1.15); }
+  }
+
+  figcaption {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 12px;
+    font-size: 13px;
+  }
+  .wx-seeing { display: block; color: var(--ink-2); }
+  .wx-credit { display: block; color: var(--mute); }
+
+  .wx-via { display: block; }
+  .wx-leap, .wx-mute, .wx-door-leap { color: var(--mute); font-size: 13px; }
+  .wx-title { margin-top: 4px; font-size: 20px; line-height: 1.3; letter-spacing: -0.01em; }
+
+  .wx-doors-head {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 22px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .wx-door {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--rule);
+    transition: opacity 0.7s var(--calm);
+    &[data-dim='true'] { opacity: 0.38; }
+  }
+
+  .wx-door-states { display: grid; width: 100%; }
+  .wx-door-grid { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 14px; text-align: left; }
+  .wx-door-wait .wx-door-text { display: flex; flex-direction: column; gap: 9px; padding-top: 6px; }
+  .wx-thumb--wait { animation: wx-breathe 1.8s ease-in-out infinite alternate; }
+  @keyframes wx-breathe { from { opacity: 0.55; } to { opacity: 1; } }
+
+  .wx-thumb {
+    display: block;
+    width: 64px;
+    height: 48px;
+    margin-top: 2px;
+    object-fit: cover;
+    background: #e9e6df;
+    &[data-gone='true'] { visibility: hidden; }
+  }
+
+  .wx-door-leap { display: flex; gap: 8px; line-height: 1.3; }
+  .wx-door-title { margin-top: 2px; line-height: 1.3; }
+  .wx-door-hook {
+    margin-top: 2px;
+    color: var(--ink-2);
+    font-size: 13px;
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .wx-fly img { display: block; object-fit: cover; }
+
+  /* The line from the detail to its door, in ink over a paper halo, as in the app */
+  .wx-line .ss-connector__line { stroke: rgb(29 28 26 / 0.7); stroke-width: 1; }
+  .wx-line { --ss-accent: rgb(29 28 26 / 0.7); }
+
+  /* Compact: the app on a phone, in screen points (402 wide), pinned a gutter from the top and
+     running off the bottom; the picture on top, the doors under it */
+  & .ss-stage[data-layout='compact'] {
+    --gutter: 16px;
+    .wx-phone { position: absolute; top: 24px; left: 24px; }
+    .wx-app { padding-top: 62px; font-size: 17px; }
+    .wx-header { height: 44px; padding: 0 20px; font-size: 17px; }
+    .wx-spread { grid-template-columns: 362px; gap: 4px; padding: 0 20px; }
+    .wx-picture { width: 362px; height: 272px; }
+    .wx-doors-head { margin-top: 18px; font-size: 15px; }
+    .wx-mute, .wx-door-leap { font-size: 14px; }
+    .wx-door { padding: 14px 0; }
+    .wx-door-grid { grid-template-columns: 72px minmax(0, 1fr); }
+    .wx-thumb { width: 72px; height: 54px; }
+    .wx-door-hook { font-size: 15px; -webkit-line-clamp: 1; }
+    .wx-dot { width: 18px; height: 18px; margin: -9px 0 0 -9px; }
+  }
+}

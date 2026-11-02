@@ -727,9 +727,6 @@ function Stimulus({ entry, first, active, dive, onFollow, onSave, sectionRef }) 
             {done && !doors.length && <p className="border-t border-rule py-3 text-mute">{data.error || "Nessuna porta da questa immagine."}</p>}
             <div className="border-t border-rule" />
           </div>
-          {done && !data.curator && doors.length > 0 && (
-            <p className="mt-3.5 text-mute">Porte dai concetti di Wikimedia: con una chiave Gemini in .env le sceglie il curatore.</p>
-          )}
         </div>
       </aside>
 

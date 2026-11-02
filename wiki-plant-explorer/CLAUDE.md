@@ -7,8 +7,8 @@ through their public APIs. Click an image to get visually similar ones; "più co
 refines the ranking, opened and saved images feed a personal "Per te" home, and a background crawler
 keeps growing a local vector index. No image is ever stored on disk: only vectors.
 
-The core is the flow (`?flow=<title>`): a continuous stream of stimuli. A curator (Gemini with a free
-Google AI Studio key, a free local vision-language model through Ollama, or Claude with a paid key) looks at each picture and opens doors from details in it to concepts
+The core is the flow (`?flow=<title>`): a continuous stream of stimuli. A curator (by default a free local
+vision-language model through Ollama; Gemini or Claude only when `CURATOR` in .env names them) looks at each picture and opens doors from details in it to concepts
 worth knowing (the mechanism, the cause, the same principle far away, the human story, another
 scale); each door is grounded in its Wikipedia article and shown with the best picture of it the
 person has not seen yet. Scrolling takes the door farthest from where they have been; clicking one
@@ -21,11 +21,12 @@ backend/commons.py   async client for Commons/Wikidata APIs (search, feed, categ
 backend/sources.py   other collections (Cleveland, iNaturalist, Unsplash, Pexels): search, get by id, items in
                      the Commons shape; `Budget` caps requests per hour for the keyed APIs
 backend/translator.py  local MarianMT Italian -> English
-.env                 UNSPLASH_ACCESS_KEY / PEXELS_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY (git-ignored;
-                     template in .env.example)
-backend/curator.py   the curator: GeminiCurator (gemini-3.8-flash, free AI Studio key), LocalCurator (Ollama,
-                     qwen3-vl:8b-instruct, free) or Curator (Claude, paid);
-                     same prompt and JSON schema, sees a picture and streams doors
+.env                 UNSPLASH_ACCESS_KEY / PEXELS_API_KEY / CURATOR / OLLAMA_MODEL / GEMINI_API_KEY /
+                     ANTHROPIC_API_KEY (git-ignored; template in .env.example)
+backend/curator.py   the curator: LocalCurator (Ollama, gemma4:26b-a4b, free, default), GeminiCurator
+                     (CURATOR=gemini) or Curator (CURATOR=claude, paid); same prompt and JSON schema,
+                     sees a picture and streams doors
+frontend/demo.html   the animated hero of the app (src/demo/: the Stageshow kit and the wiki-explorer scene)
 backend/embedder.py  DINOv2 (visual, 768-d) + OpenCLIP ViT-B-32 (semantic, 512-d), batched, L2-normalised;
                      `regions`: an image's parts from DINOv2 patch tokens (k-means + connected blobs)
 backend/main.py      FastAPI: /api/flow(/stream), /api/foryou, /api/feed, /api/search, /api/file, /api/page, /api/concepts,
@@ -116,20 +117,34 @@ Each picture is a `FlowRun`: events (`item`, `seeing`, `door`, `drop`, `done` wi
 per line; `/api/flow` waits for `done` (used to prepare the next picture ahead, `warm: true`). A
 picture being worked out is followed, never asked for twice; finished ones are cached (64).
 
-1. Curator (`curator.py`): the picture (1024 px JPEG, in memory) + the concept that led here + the
-   concepts already met (`flow_memory()["seen"]`, never lead back), structured output (`SCHEMA`):
-   `seeing` + 5 doors {anchor, box, leap ∈ dentro/perché/altrove/storia/scala, title,
-   wikipedia_it/en, hook, image_query}. `Engine.stream` yields ("seeing", text) and ("door", door)
-   as they become known. Engine chosen at startup: `GeminiCurator` when `GEMINI_API_KEY` is set
-   (Interactions API with `stream: true`, server-sent `step.delta` text read by `AnswerStream` as it
-   is written; `store: false`; `response_format` = the JSON schema; free tier, Google may use the
-   requests). Its `thinking_level` is low while the person waits (~9 s) and `GEMINI_THINKING`
-   (default medium, 30-70 s, richest doors) for the picture prepared ahead. Else `LocalCurator` when
-   Ollama (`OLLAMA_URL`, default 127.0.0.1:11434) serves `OLLAMA_MODEL` (default
-   `qwen3-vl:8b-instruct`; `format` = the JSON schema, `think: false`), free and on this Mac; else
-   Claude Opus 5.5 with `ANTHROPIC_API_KEY` (effort medium, `fallbacks: "default"`). These two answer
-   whole. Boxes are normalised (Qwen and Gemini answer in thousandths). Run Ollama with `ollama serve`
-   before the backend.
+1. Curator (`curator.py`): the picture (JPEG in memory, 896 px for the local model) + the concept
+   that led here + the concepts already met (`flow_memory()["seen"]`, never lead back), the JSON
+   schema (`SCHEMA`): `seeing` + up to 5 doors {anchor, anchor_en, box, leap ∈
+   dentro/perché/altrove/storia/scala, title, wikipedia_it/en, hook, image_query}. The prompt says what
+   not to point at (unreadable text, watermarks, defects, empty background, generic photography
+   concepts) and asks for specific concepts, fewer doors on a plain picture. `Engine.stream` yields
+   ("seeing", text) and ("door", door) as `AnswerStream` reads them from the text being written.
+   Engine chosen at startup by `CURATOR` (default `local`; a key alone never turns a paid engine on).
+   A cloud engine is wrapped in `Fallback`: when it answers nothing (402, 429, network) the local
+   model answers the same picture.
+   - `LocalCurator`: Ollama (`OLLAMA_URL`, default 127.0.0.1:11434) serving `OLLAMA_MODEL` (default
+     `LOCAL_MODEL` = `gemma4:26b-a4b`, a 4B-active MoE), streamed, `think: false`, `keep_alive` 2 h and
+     loaded at startup. Ollama's MLX runner has no structured output (HTTP 501): the schema then goes
+     in the prompt and `normalise_door` fills missing fields. Its hooks are emptied (a local model's
+     facts are not trusted) and `open_door` shows Wikipedia's first sentence instead. Tried 2026-11: qwen3-vl:8b (weak, invents
+     text), qwen3-vl:30b-a3b (65-220 s, invents more), gemma4 with thinking (a few sharper doors,
+     minutes): gemma4 without thinking wins. ~25-35 s per picture (first door ~10 s) on the M1 Max,
+     slower in Low Power Mode.
+   - `GeminiCurator` (`CURATOR=gemini`): Interactions API, `stream: true`, `store: false`; free only
+     on a project without billing (2026-11: the key's project was prepaid and every picture cost; on
+     402/429 it stops asking for 15 min). `thinking_level` low while the person waits, `GEMINI_THINKING`
+     for the picture prepared ahead.
+   - `Curator` (`CURATOR=claude`): Claude Opus 5.5 (effort medium, `fallbacks: "default"`), whole.
+   Boxes are normalised (thousandths or pixels). Run Ollama with `ollama serve` before the backend.
+   Without a curator, or when it answers nothing, the flow says so (503): no doors are invented.
+   `in_picture` drops a door whose box is the whole picture, repeats another door's detail (IoU >
+   0.6), or clearly misses its detail (CLIP of the padded crop with "a photo of <anchor_en>" < 0.17
+   and 0.05 under the whole picture's).
 2. Each door is grounded as soon as it closes in the stream. `ground_article`: kept only if its
    Wikipedia article exists (Italian first, not a disambiguation, not a place or work); the exact
    title and Wikipedia search are asked at once, and a search hit counts only if it carries most of
@@ -143,8 +158,7 @@ picture being worked out is followed, never asked for twice; finished ones are c
    by relevance + beauty + 0.02 for curated. Then the door is sent again `ready`, or `drop`ped.
 4. `farthest`: the door scrolling takes = lowest CLIP text similarity to the concepts met, +0.05 for
    altrove/scala. The frontend prepares it ahead once the picture is done.
-Without a curator the doors are `/api/concepts`' Wikimedia concepts of the image's DINOv2 parts.
-Timing with Gemini: picture at once, `seeing` ~3 s, first door ~4-5 s, all ~10-12 s.
+Timing with gemma4: picture at once, `seeing` ~5 s, first door ~10 s, all ~25-35 s.
 
 Frontend (`Flow`, `Stimulus` in App.jsx): each picture is a spread, the picture on the left (sticky,
 as large as the screen allows, with what the curator sees and the credits under it) and on the right
@@ -226,7 +240,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
 uvicorn backend.main:app --host 127.0.0.1 --port 8001   # loads DINOv2, CLIP, MarianMT (downloads them on first run)
 
-cd frontend && npm install && API_TARGET=http://127.0.0.1:8001 npm run dev   # http://localhost:5173
+cd frontend && npm install && API_TARGET=http://127.0.0.1:8001 npm run dev   # http://localhost:5173 (demo: /demo.html)
 ```
 
 ## Gotchas

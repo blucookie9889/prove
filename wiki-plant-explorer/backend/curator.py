@@ -6,14 +6,15 @@ away, the human story, another scale. The curator also gets the concepts already
 journey, so it never leads back. Everything it says is then grounded by the caller: a door is kept
 only if its Wikipedia article exists, and the text shown is Wikipedia's.
 
-Three engines, same prompt and schema:
-  - ``GeminiCurator``: Google Gemini (default ``gemini-3.8-flash``) with a free Google AI Studio key
-    (``GEMINI_API_KEY``, optional ``GEMINI_MODEL``, ``GEMINI_THINKING``). Free tier: Google may use the requests to improve
-    its products. Sent with ``store: false``, so the interaction is not kept on Google's side.
-    Preferred when the key is set.
-  - ``LocalCurator``: a free open model on this Mac through Ollama (default ``qwen3-vl:8b-instruct``,
-    ``OLLAMA_MODEL`` / ``OLLAMA_URL`` in .env). Nothing leaves the computer.
-  - ``Curator``: Claude through the Anthropic API (paid, needs ANTHROPIC_API_KEY).
+Three engines, same prompt and schema (``CURATOR`` in .env picks one; default ``local``):
+  - ``LocalCurator``: an open vision-language model on this Mac through Ollama (``OLLAMA_MODEL`` /
+    ``OLLAMA_URL``). Free, and nothing leaves the computer. The default and the only one used unless
+    another is chosen explicitly.
+  - ``GeminiCurator`` (``CURATOR=gemini``): Google Gemini (default ``gemini-3.8-flash``) with an AI Studio
+    key (``GEMINI_API_KEY``). Free only on a project without billing: on a paid or prepaid project every
+    picture costs. Sent with ``store: false``. It stops asking for a while after "payment required" or
+    "quota exhausted".
+  - ``Curator`` (``CURATOR=claude``): Claude through the Anthropic API (paid, needs ANTHROPIC_API_KEY).
 The image is sent in memory as base64; nothing is stored.
 """
 
@@ -24,6 +25,7 @@ import io
 import json
 import logging
 import re
+import time
 from typing import AsyncIterator, Optional
 
 import anthropic
@@ -49,9 +51,24 @@ concept that has its own Wikipedia article. A door is one of five kinds:
 - storia: the human story attached to it (who discovered, used, feared or made it);
 - scala: the same thing at a very different scale (atoms, cells, cities, galaxies).
 
+What to point at:
+- Only things you can clearly see in this picture, big enough to be framed by a box, and that you can \
+  name with confidence. The box must tightly contain that thing and nothing else of note: the person \
+  will see exactly that crop.
+- Use the picture's file name as a strong clue to what it shows (species, place, object, event).
+- Never point at: text or inscriptions you cannot read, watermarks, borders, blur, noise or other \
+  defects of the photo, empty background, or the photograph itself. Never use generic photography \
+  concepts (photography, light, shadow, perspective, composition, colour) unless they are truly the \
+  subject.
+- When the picture is plain, open fewer doors (three is fine) rather than inventing details.
+
 What makes a good door:
+- The link between the detail and the concept is real and specific: the hook states it.
 - It is true. Prefer phenomena, mechanisms, laws, materials, techniques, histories over plain labels: \
   "superhydrophobicity" beats "water"; "phyllotaxis" beats "leaf"; "Rayleigh scattering" beats "sky".
+- It is specific. Never a broad textbook chapter (photosynthesis, steel, civil engineering, urban \
+  planning, road safety, polymers, erosion): name the precise phenomenon, law, technique or story that \
+  this very detail shows ("Kautsky effect", "Martensite", "Euler buckling", "Cerdà's Eixample grid").
 - Its hook is one surprising, precise, verifiable fact that makes the person want to go through. No \
   marketing, no exclamation marks, no questions, no "did you know".
 - The five doors are different from each other: different details of the picture, different kinds \
@@ -60,7 +77,8 @@ What makes a good door:
 - If the picture shows something famous (a species, a building, an artwork), you may use it, but the \
   best doors usually come from details and from what they mean.
 
-Be brief: anchor 2-5 words, hook at most 18 words, image_query at most 6 words, seeing one short sentence.
+Be brief: anchor 2-5 words (anchor_en: the same detail in plain English, as a photo caption would name \
+it: "engraved name plate", "moss between bricks"), hook at most 18 words, image_query at most 6 words, seeing one short sentence.
 
 The person reads Italian. Write anchor, title and hook in Italian. Give the article title exactly as it \
 is on Italian Wikipedia when that article exists (else an empty string) and exactly as on English \
@@ -78,6 +96,7 @@ SCHEMA = {
                 "type": "object",
                 "properties": {
                     "anchor": {"type": "string", "description": "The visible detail in 2-5 Italian words (words, not coordinates)."},
+                    "anchor_en": {"type": "string", "description": "The same visible detail in 2-5 plain English words."},
                     "x0": {"type": "number"},
                     "y0": {"type": "number"},
                     "x1": {"type": "number"},
@@ -89,7 +108,7 @@ SCHEMA = {
                     "hook": {"type": "string"},
                     "image_query": {"type": "string"},
                 },
-                "required": ["anchor", "x0", "y0", "x1", "y1", "leap", "title", "wikipedia_it", "wikipedia_en",
+                "required": ["anchor", "anchor_en", "x0", "y0", "x1", "y1", "leap", "title", "wikipedia_it", "wikipedia_en",
                              "hook", "image_query"],
                 "additionalProperties": False,
             },
@@ -106,14 +125,27 @@ def context_text(name: str, via: Optional[str], seen: list[str]) -> str:
         lines.append(f"The person arrived at this picture through the concept: {via}.")
     if seen:
         lines.append("Concepts already met (do not lead back to them or near variants): " + "; ".join(seen[-60:]) + ".")
-    lines.append(f"Open {DOORS} doors, each from a different detail. Each box (x0, y0, x1, y1) tightly frames that detail, "
+    lines.append(f"Open up to {DOORS} doors, each from a different detail. Each box (x0, y0, x1, y1) tightly frames that detail, "
                  "as integers from 0 to 1000 relative to the picture's width and height.")
     return "\n".join(lines)
 
 
 def normalise_door(d: dict) -> dict:
-    """Box as fractions: some models answer in thousandths (Qwen-VL, Gemini) or pixels of the 1024 px image."""
-    box = [float(d.get(k) or 0) for k in ("x0", "y0", "x1", "y1")]
+    """Box as fractions: some models answer in thousandths (Qwen-VL, Gemini) or pixels of the 1024 px image.
+    Missing fields (a model without structured output may skip some) become empty."""
+    for k in SCHEMA["properties"]["doors"]["items"]["properties"]:
+        if not isinstance(d.get(k), (str, int, float)):
+            d[k] = ""
+    if d["leap"] not in LEAPS:
+        d["leap"] = "altrove"
+
+    def num(v) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    box = [num(d[k]) for k in ("x0", "y0", "x1", "y1")]
     top = max(box)
     scale = 1.0 if top <= 1.5 else 1000.0 if top <= 1000 else float(SIDE)
     x0, y0, x1, y1 = (v / scale for v in box)
@@ -206,9 +238,9 @@ class Engine:
             yield "door", d
 
 
-def jpeg_b64(image: Image.Image) -> str:
+def jpeg_b64(image: Image.Image, side: int = SIDE) -> str:
     im = image.convert("RGB")
-    im.thumbnail((SIDE, SIDE))
+    im.thumbnail((side, side))
     buf = io.BytesIO()
     im.save(buf, format="JPEG", quality=85)
     return base64.standard_b64encode(buf.getvalue()).decode()
@@ -267,10 +299,14 @@ class Curator(Engine):
 class LocalCurator(Engine):
     """The same curator on an open vision-language model served by Ollama on this Mac: free."""
 
+    KEEP = "2h"  # keep the model in memory between pictures: loading it takes 5-15 s
+    SIDE = 896  # smaller than for the cloud models: fewer image tokens to read, same details
+
     def __init__(self, url: str, model: str):
         self.url = url.rstrip("/")
         self.model = model
-        self.http = httpx.AsyncClient(timeout=300)
+        self.http = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=5))
+        self.structured = True  # Ollama's MLX runner (Gemma 4) has no structured output: the schema goes in the prompt
 
     async def available(self) -> bool:
         try:
@@ -279,29 +315,80 @@ class LocalCurator(Engine):
             return False
         return any(m.get("name") == self.model or m.get("model") == self.model for m in tags.get("models", []))
 
-    async def doors(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
-                    deep: bool = True) -> Optional[dict]:
+    async def warm_up(self) -> None:
+        """Loads the model now, so the first picture does not wait for it."""
+        try:
+            await self.http.post(f"{self.url}/api/generate", json={"model": self.model, "keep_alive": self.KEEP})
+        except httpx.HTTPError as exc:
+            log.warning("local curator: could not load %s: %s", self.model, exc)
+
+    async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
+                     deep: bool = True) -> AsyncIterator[tuple[str, object]]:
+        text = context_text(name, via, seen)
+        if not self.structured:
+            text += "\nAnswer with one JSON object only, no other text, following this JSON schema:\n" + json.dumps(SCHEMA)
         body = {
             "model": self.model,
-            "stream": False,
-            "think": False,  # the schema already structures the answer; thinking would double the wait
-            "format": SCHEMA,
-            "options": {"temperature": 0.7, "num_ctx": 8192},
+            "stream": True,
+            "think": False,  # tried on: a few sharper doors, minutes instead of seconds
+            "keep_alive": self.KEEP,
+            "options": {"temperature": 0.6, "num_ctx": 8192},
             "messages": [
                 {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": context_text(name, via, seen), "images": [jpeg_b64(image)]},
+                {"role": "user", "content": text, "images": [jpeg_b64(image, self.SIDE)]},
             ],
         }
+        if self.structured:
+            body["format"] = SCHEMA
+        answer = AnswerStream()
+        last: dict = {}
         try:
-            resp = await self.http.post(f"{self.url}/api/chat", json=body)
-            resp.raise_for_status()
-            reply = resp.json()
-            data = json.loads(reply["message"]["content"])
-        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            async with self.http.stream("POST", f"{self.url}/api/chat", json=body) as resp:
+                if resp.status_code != 200:
+                    text = (await resp.aread()).decode(errors="replace")
+                    if resp.status_code == 501 and self.structured and "structured output" in text:
+                        self.structured = False
+                        log.info("local curator: %s has no structured output, the schema goes in the prompt", self.model)
+                        async for event in self.stream(image, name, via, seen, deep):
+                            yield event
+                        return
+                    log.warning("local curator: HTTP %s for %s: %s", resp.status_code, name, text[:300])
+                    return
+                async for line in resp.aiter_lines():
+                    try:
+                        last = json.loads(line)
+                    except ValueError:
+                        continue
+                    for kind, value in answer.feed((last.get("message") or {}).get("content", "")):
+                        if kind == "door":
+                            # A local model picks good details and concepts but invents facts in its
+                            # hooks: an empty hook makes the grounding show Wikipedia's first sentence
+                            value["hook"] = ""
+                        yield kind, value
+        except httpx.HTTPError as exc:
             log.warning("local curator failed for %s: %s", name, exc)
-            return None
-        log.info("local curator %s: %s tokens out in %.1fs", name, reply.get("eval_count"), (reply.get("total_duration") or 0) / 1e9)
-        return normalise(data)
+            return
+        log.info("local curator %s: %s in / %s out tokens, %.1fs (load %.1fs)", name, last.get("prompt_eval_count"),
+                 last.get("eval_count"), (last.get("total_duration") or 0) / 1e9, (last.get("load_duration") or 0) / 1e9)
+
+
+class Fallback(Engine):
+    """One engine, and another when the first answers nothing (no credit, quota, network)."""
+
+    def __init__(self, first: Engine, then: Optional[Engine]):
+        self.first, self.then = first, then
+        self.model = f"{first.model}, else {then.model}" if then else first.model
+
+    async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
+                     deep: bool = True) -> AsyncIterator[tuple[str, object]]:
+        answered = False
+        async for event in self.first.stream(image, name, via, seen, deep):
+            answered = True
+            yield event
+        if not answered and self.then:
+            log.info("curator: %s answered nothing for %s, asking %s", self.first.model, name, self.then.model)
+            async for event in self.then.stream(image, name, via, seen, deep):
+                yield event
 
 
 class GeminiCurator(Engine):
@@ -313,6 +400,7 @@ class GeminiCurator(Engine):
         self.model = model
         self.thinking = thinking  # medium: 30-70 s and the richest doors; low: ~9 s, more obvious doors
         self.http = httpx.AsyncClient(timeout=120, headers={"x-goog-api-key": api_key})
+        self.off_until = 0.0  # after "payment required" / "quota exhausted": stop asking for a while
 
     async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
                      deep: bool = True) -> AsyncIterator[tuple[str, object]]:
@@ -328,14 +416,18 @@ class GeminiCurator(Engine):
             "response_format": {"type": "text", "mime_type": "application/json", "schema": SCHEMA},
             "generation_config": {"thinking_level": self.thinking if deep else "low"},  # low while someone waits
         }
+        if time.time() < self.off_until:
+            return
         answer = AnswerStream()
         usage: dict = {}
         try:
             async with self.http.stream("POST", self.URL, json=body) as resp:
                 if resp.status_code != 200:
                     text = (await resp.aread()).decode(errors="replace")
-                    level = log.error if resp.status_code in (400, 401, 403) else log.warning
+                    level = log.error if resp.status_code in (400, 401, 402, 403) else log.warning
                     level("gemini curator: HTTP %s for %s: %s", resp.status_code, name, text[:300])
+                    if resp.status_code in (402, 429):
+                        self.off_until = time.time() + 15 * 60
                     return
                 # Server-sent events: "data: {...}" lines; the text arrives in step.delta events.
                 async for line in resp.aiter_lines():

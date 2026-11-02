@@ -32,7 +32,7 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient, models
 
 from .commons import Commons
-from .curator import Curator, GeminiCurator, LocalCurator
+from .curator import Curator, Fallback, GeminiCurator, LocalCurator
 from .sources import Cleveland, INaturalist, Pexels, RateLimited, Unsplash
 from .translator import Translator
 from .embedder import SEMANTIC_DIM, VISUAL_DIM, Embedder
@@ -117,10 +117,19 @@ LINK_TARGETS = 10
 # door in a painting leads to doors, not to more of the same painting.
 LINK_ESCAPE = 0.5
 PAGES_CACHED = 32
-# Flow: a continuous stream of stimuli. Each image opens doors (the curator's, see curator.py, or
-# without an API key the Wikimedia concepts of its parts); each door is grounded in its Wikipedia
-# article and shown with the best picture of it that the person has not seen yet.
+# Flow: a continuous stream of stimuli. Each image opens doors (the curator's, see curator.py); each
+# door is checked against the picture, grounded in its Wikipedia article and shown with the best
+# picture of it that the person has not seen yet.
+LOCAL_MODEL = "gemma4:26b-a4b"  # Ollama model of the local curator (OLLAMA_MODEL in .env overrides it)
 FLOW_CACHED = 64
+# A door must point at something: its box is not the whole picture, not the same detail as a door
+# already open, and the crop (grown by DOOR_PAD) is not clearly less like the named detail than the
+# whole picture is (CLIP cosine with "a photo of <anchor_en>": below DOOR_FIT and DOOR_MISS under it).
+DOOR_WHOLE = 0.8  # box area share of the picture
+DOOR_SAME = 0.6  # IoU with another door's box
+DOOR_PAD = 0.15
+DOOR_FIT = 0.17
+DOOR_MISS = 0.05
 FLOW_SPREAD = 0.05  # pictures within this CLIP relevance of the best one compete on beauty
 FLOW_SAME_LOOK = 0.85  # DINOv2 cosine to a picture already shown: too much of the same
 FLOW_RECENT = 200  # pictures remembered for that
@@ -173,21 +182,25 @@ async def lifespan(_: FastAPI):
     aesthetic(np.zeros((1, SEMANTIC_DIM), dtype=np.float32))  # encode the beauty prompts once
     S["commons"] = Commons()
     S["sources"] = make_sources(S["commons"])
-    # The curator: Gemini with a free AI Studio key, else the free local model when Ollama runs it,
-    # else Claude with a key, else none.
+    # The curator: the free local model through Ollama, unless CURATOR in .env explicitly picks a
+    # cloud one (gemini, claude), which then falls back to the local model when it answers nothing.
+    # A key alone never turns a paid engine on.
     env = load_env()
-    local = LocalCurator(env.get("OLLAMA_URL", "http://127.0.0.1:11434"), env.get("OLLAMA_MODEL", "qwen3-vl:8b-instruct"))
-    if env.get("GEMINI_API_KEY"):
-        S["curator"] = GeminiCurator(env["GEMINI_API_KEY"], env.get("GEMINI_MODEL", "gemini-3.8-flash"),
-                                       env.get("GEMINI_THINKING", "medium"))
-    elif await local.available():
-        S["curator"] = local
-    elif env.get("ANTHROPIC_API_KEY"):
-        S["curator"] = Curator(env["ANTHROPIC_API_KEY"])
+    choice = env.get("CURATOR", "local").lower()
+    local: Optional[LocalCurator] = LocalCurator(env.get("OLLAMA_URL", "http://127.0.0.1:11434"),
+                                                 env.get("OLLAMA_MODEL", LOCAL_MODEL))
+    if await local.available():
+        asyncio.ensure_future(local.warm_up())
     else:
-        S["curator"] = None
+        local = None
+    S["curator"] = local
+    if choice == "gemini" and env.get("GEMINI_API_KEY"):
+        S["curator"] = Fallback(GeminiCurator(env["GEMINI_API_KEY"], env.get("GEMINI_MODEL", "gemini-3.8-flash"),
+                                              env.get("GEMINI_THINKING", "medium")), local)
+    elif choice == "claude" and env.get("ANTHROPIC_API_KEY"):
+        S["curator"] = Fallback(Curator(env["ANTHROPIC_API_KEY"]), local)
     log.info("curator: %s", f"{type(S['curator']).__name__} ({S['curator'].model})" if S["curator"] else
-             "off (no GEMINI_API_KEY, no Ollama model, no ANTHROPIC_API_KEY): Wikimedia concepts only")
+             f"off (CURATOR={choice}: Ollama not running, model not pulled, or key missing)")
     log.info("sources: Wikimedia Commons, %s", ", ".join(src.label for src in S["sources"].values()))
     client = QdrantClient(path=str(DB_PATH))
     if not client.collection_exists(COLLECTION):
@@ -224,7 +237,7 @@ def load_env() -> dict:
                 env[key.strip()] = value.strip().strip("'\"")
     env.update({k: v for k, v in os.environ.items()
                 if k in ("UNSPLASH_ACCESS_KEY", "PEXELS_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GEMINI_MODEL",
-                         "GEMINI_THINKING", "OLLAMA_URL", "OLLAMA_MODEL")})
+                         "GEMINI_THINKING", "OLLAMA_URL", "OLLAMA_MODEL", "CURATOR")})
     return env
 
 
@@ -1275,19 +1288,36 @@ async def ground_pictures(door: dict, taken: set) -> bool:
     return True
 
 
-async def wikimedia_doors(title: str) -> tuple[str, list[dict]]:
-    """Doors without the curator: the parts of the image named by Wikimedia concepts (/api/concepts)."""
-    data = await page(title)
-    named = (await concepts(title))["concepts"]
-    doors = []
-    for l, c in zip(data["links"], named):
-        if not c or not c.get("extract"):
-            continue
-        hook = re.split(r"(?<=[.!?])\s", c["extract"], maxsplit=1)[0]
-        doors.append({"anchor": "", "box": l["box"], "dot": l["dot"], "leap": "dentro", "title": c["name"], "hook": hook,
-                      "about": c.get("about"), "lang": c.get("lang"), "extract": c["extract"], "url": c.get("url"),
-                      "item": l["items"][0], "more": l["items"][1:4]})
-    return "", doors
+def iou(a: list[float], b: list[float]) -> float:
+    w = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    h = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = w * h
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def in_picture(image, raw: dict, boxes: list[list[float]]) -> Optional[str]:
+    """Why the curator's door does not point at a real, new detail of ``image`` (None when it does)."""
+    box = [min(1.0, max(0.0, float(raw[k]))) for k in ("x0", "y0", "x1", "y1")]
+    if (box[2] - box[0]) * (box[3] - box[1]) > DOOR_WHOLE:
+        return "box is the whole picture"
+    if box[2] - box[0] < 0.01 or box[3] - box[1] < 0.01:
+        return "empty box"
+    if any(iou(box, b) > DOOR_SAME for b in boxes):
+        return "same detail as another door"
+    if image is None or not raw.get("anchor_en"):
+        return None
+    W, H = image.size
+    w, h = max(box[2] - box[0], 0.08) * (1 + 2 * DOOR_PAD), max(box[3] - box[1], 0.08) * (1 + 2 * DOOR_PAD)
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    crop = image.crop((int(max(0, cx - w / 2) * W), int(max(0, cy - h / 2) * H),
+                       int(min(1, cx + w / 2) * W), int(min(1, cy + h / 2) * H)))
+    _, sem = S["embedder"].embed_batch([crop, image])
+    sem = np.asarray(sem, dtype=np.float32)
+    fit, whole = sem @ label_vectors([raw["anchor_en"]])[0]
+    if fit < DOOR_FIT and whole - fit > DOOR_MISS:
+        return f"box misses {raw['anchor_en']!r} ({fit:.2f} vs {whole:.2f} for the whole picture)"
+    return None
 
 
 def farthest(doors: list[dict]) -> int:
@@ -1413,8 +1443,6 @@ async def flow_step(step: FlowStep, run: FlowRun) -> dict:
     curator = S.get("curator")
 
     async def picture():
-        if not curator:
-            return None
         try:
             return await S["commons"].fetch_image(large_url(item))
         except Exception:  # noqa: BLE001
@@ -1428,14 +1456,20 @@ async def flow_step(step: FlowStep, run: FlowRun) -> dict:
     taken = {step.title}
     used: set = set()
 
+    boxes: list = []  # of the doors that point at something
+
     async def open_door(raw: dict, ident: int) -> None:
+        async with S["embed_lock"]:
+            miss = await asyncio.to_thread(in_picture, image, raw, boxes)
+        if miss:
+            log.info("flow: dropped %r (%s)", raw.get("title"), miss)
+            return
+        boxes.append([raw[k] for k in ("x0", "y0", "x1", "y1")])
         door = await ground_article(raw)
         if not door or door["about"] in used:  # one door per article
             return
         used.add(door["about"])
-        if isinstance(curator, LocalCurator):
-            # A small local model picks good details and concepts but invents facts in its hooks:
-            # the line shown is Wikipedia's own first sentence instead.
+        if not door["hook"]:  # the local curator's hooks are not trusted: Wikipedia's first sentence
             door["hook"] = re.split(r"(?<=[.!?])\s", door["extract"], maxsplit=1)[0]
         door.update(id=ident, ready=False)
         doors.append(door)
@@ -1460,11 +1494,10 @@ async def flow_step(step: FlowStep, run: FlowRun) -> dict:
             elif len(jobs) < 7:
                 jobs.append(asyncio.ensure_future(open_door(value, len(jobs))))
         await asyncio.gather(*jobs, return_exceptions=True)
-    if not doors:
-        seeing, doors = await wikimedia_doors(step.title)
-        for i, d in enumerate(doors):
-            d.update(id=100 + i, ready=True)
-            run.emit({"type": "door", "door": d})
+    if not curator:
+        raise HTTPException(503, "Il curatore non è attivo: avvia Ollama (ollama serve) e riavvia il backend.")
+    if not seeing and not doors:
+        raise HTTPException(503, "Il curatore non ha risposto, riprova.")
     nxt = await asyncio.to_thread(farthest, doors)
     mem["seen"].extend(d["title"] for d in doors)
     del mem["seen"][:-200]
