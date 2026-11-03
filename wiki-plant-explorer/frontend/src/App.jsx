@@ -137,7 +137,7 @@ function Card({ item, index, animated, onOpen, onSave, onVote, voting }) {
         />
       </button>
       <figcaption className="calm flex items-baseline gap-3 pt-1.5 pb-1 text-mute opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100">
-        <span className="min-w-0 flex-1 truncate">{item.name}</span>
+        <span className="min-w-0 flex-1 truncate">{prettyName(item.name)}</span>
         {item.match != null && <span>{Math.round(item.match * 100)}</span>}
         {onVote && (
           <>
@@ -534,11 +534,44 @@ function FlowPicture({ item, seeing, doors, hover, setHover, onFollow, dotRefs, 
         ))}
       </div>
       <figcaption className="mt-3 flex w-[min(100%,calc(68svh*var(--r)))] flex-col gap-1 lg:w-[min(100%,calc((100svh-210px)*var(--r)))]" style={{ "--r": ratio }}>
-        {seeing ? <p className="text-ink-2">{seeing}</p> : null}
-        <p className="truncate text-mute">{[showName ? item?.name : null, item?.author, item?.license].filter(Boolean).join(" · ")}</p>
+        <p className="min-h-[1lh] text-ink-2">{seeing || ""}</p>
+        <p className="truncate text-mute">{[showName ? prettyName(item?.name) : null, prettyAuthor(item?.author), item?.license].filter(Boolean).join(" · ")}</p>
       </figcaption>
     </figure>
   );
+}
+
+/**
+ * A file name as a title: without camera codes, dates, shot numbers and IDs
+ * ("DSC08246 Memorial Stones … 2025-09" -> "Memorial Stones …",
+ * "Beech Forest (AU), Great Otway National Park -- 2019 -- 1294" -> "Beech Forest (AU), Great Otway National Park").
+ */
+function prettyName(name) {
+  if (!name) return "";
+  const clean = name
+    .replace(/\s+--\s.*$/, "")
+    .replace(/\b(?:DSCF?|IMG|DCIM|PXL|P|GOPR)[_-]?\d{3,}\b/gi, "")
+    .replace(/\(\d{5,}\)/g, "")
+    .replace(/^\d{2}[-_.]\d{2}(?:[-_.]\d{2})?[-_\s]+/, "")
+    .replace(/[,\s-]+\b(?:19|20)\d\d(?:[-_.]\d\d){0,2}\b/g, "")
+    .replace(/[\s_-]+\d{2,}\s*$/, "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[\s,.:;_-]+|[\s,.:;_-]+$/g, "");
+  return clean || name;
+}
+
+/** Commons' author as a name: "No machine-readable author provided. Loganberry assumed (based on
+ * copyright claims)." -> "Loganberry". */
+function prettyAuthor(author) {
+  if (!author) return "";
+  const assumed = author.match(/^No machine-readable author provided\.\s*(.+?)\s+assumed\b/i);
+  return (assumed ? assumed[1] : author).replace(/\s*\((?:talk|discussione)\)\s*/gi, " ").trim();
+}
+
+/** ``extract`` without its opening when that is the ``hook`` already shown. */
+function restOf(extract, hook) {
+  if (!extract) return "";
+  return hook && extract.startsWith(hook) ? extract.slice(hook.length).trim() : extract;
 }
 
 /** Wikipedia's explanation, a few lines, the rest a click away. */
@@ -567,7 +600,9 @@ function Extract({ text }) {
 function DoorRow({ door, n, isNext, hover, onHover, onFollow, thumbRef }) {
   const dim = hover >= 0 && hover !== n;
   return (
-    <div className="rise">
+    // The row opens its own height as it arrives, so the rows under it glide down instead of jumping
+    <div className="open-in">
+    <div className="rise min-h-0">
     <button
       type="button"
       data-door={n}
@@ -602,9 +637,10 @@ function DoorRow({ door, n, isNext, hover, onHover, onFollow, thumbRef }) {
           )}
         </span>
         <span className={`block transition-colors duration-[1200ms] first-letter:uppercase ${door.ready ? "text-ink" : "text-mute"}`}>{door.title}</span>
-        <span className="line-clamp-2 block text-ink-2">{door.hook}</span>
+        <span className="line-clamp-2 text-ink-2">{door.hook}</span>
       </span>
     </button>
+    </div>
     </div>
   );
 }
@@ -644,7 +680,7 @@ function Stimulus({ entry, first, active, dive, onFollow, onSave, sectionRef }) 
     <section
       id={entry.key}
       ref={host}
-      className="relative grid scroll-mt-16 grid-cols-1 content-center gap-x-16 gap-y-10 py-10 lg:min-h-[calc(100svh-64px)] lg:grid-cols-[minmax(0,1fr)_minmax(320px,400px)] lg:py-8"
+      className="relative grid scroll-mt-16 grid-cols-1 content-start gap-x-16 gap-y-10 py-10 lg:min-h-[calc(100svh-64px)] lg:grid-cols-[minmax(0,1fr)_minmax(320px,400px)] lg:py-8"
     >
       <div className={`lg:sticky lg:top-[88px] lg:self-start ${first ? "fade-in" : "rise rise-1"}`}>
         <FlowPicture
@@ -660,7 +696,7 @@ function Stimulus({ entry, first, active, dive, onFollow, onSave, sectionRef }) 
         />
       </div>
 
-      <aside className="flex min-w-0 flex-col gap-3.5 self-center lg:min-h-[calc(100svh-210px)] lg:justify-center lg:py-6">
+      <aside className="flex min-w-0 flex-col gap-3.5 self-start">
         {via ? (
           <>
             <p className="rise rise-1 text-mute">
@@ -669,7 +705,8 @@ function Stimulus({ entry, first, active, dive, onFollow, onSave, sectionRef }) 
             </p>
             <h2 className="rise rise-1 first-letter:uppercase">{via.title}</h2>
             <p className="rise rise-2">{via.hook}</p>
-            {via.extract && <Extract text={via.extract} />}
+            {/* The local curator's hook is the extract's first sentence: only the rest follows it */}
+            {restOf(via.extract, via.hook) && <Extract text={restOf(via.extract, via.hook)} />}
             <p className="rise rise-3 flex flex-wrap gap-x-5 text-mute">
               {via.url && (
                 <a href={via.url} target="_blank" rel="noreferrer">
@@ -685,7 +722,9 @@ function Stimulus({ entry, first, active, dive, onFollow, onSave, sectionRef }) 
           </>
         ) : (
           <>
-            <h1 className="rise rise-1">{item?.name || " "}</h1>
+            <h1 className="rise rise-1">{prettyName(item?.name) || " "}</h1>
+            {/* Its line is kept while the picture is being found, so nothing under it moves */}
+            {!item && <p className="min-h-[1lh]" />}
             {item && (
               <p className="rise rise-2 flex flex-wrap gap-x-5 text-mute">
                 <button type="button" onClick={() => onSave(item)} className="link">
@@ -704,10 +743,13 @@ function Stimulus({ entry, first, active, dive, onFollow, onSave, sectionRef }) 
         <div className="mt-6 flex flex-col">
           <p className="mb-2.5 flex items-baseline justify-between gap-4 text-mute">
             <span>Da qui</span>
+            {/* Each state fades in as the one before it goes (keyed), never a word swapped in place */}
             {!done ? (
-              <Breathing>{data?.seeing ? "Cerco le porte" : "Guardo cosa c'è di interessante"}</Breathing>
+              <Breathing key={data?.seeing ? "doors" : "look"}>
+                <span className="fade-in">{data?.seeing ? "Cerco le porte" : "Guardo cosa c'è di interessante"}</span>
+              </Breathing>
             ) : (
-              doors.length > 0 && active && <span className="hidden lg:inline">1–{doors.length} per aprire</span>
+              doors.length > 0 && active && <span key="keys" className="fade-in hidden lg:inline">1–{doors.length} per aprire</span>
             )}
           </p>
           <div className="flex flex-col">

@@ -129,12 +129,18 @@ picture being worked out is followed, never asked for twice; finished ones are c
    model answers the same picture.
    - `LocalCurator`: Ollama (`OLLAMA_URL`, default 127.0.0.1:11434) serving `OLLAMA_MODEL` (default
      `LOCAL_MODEL` = `gemma4:26b-a4b`, a 4B-active MoE), streamed, `think: false`, `keep_alive` 2 h and
-     loaded at startup. Ollama's MLX runner has no structured output (HTTP 501): the schema then goes
-     in the prompt and `normalise_door` fills missing fields. Its hooks are emptied (a local model's
-     facts are not trusted) and `open_door` shows Wikipedia's first sentence instead. Tried 2026-11: qwen3-vl:8b (weak, invents
-     text), qwen3-vl:30b-a3b (65-220 s, invents more), gemma4 with thinking (a few sharper doors,
-     minutes): gemma4 without thinking wins. ~25-35 s per picture (first door ~10 s) on the M1 Max,
-     slower in Low Power Mode.
+     loaded at startup. Its time goes into writing (~30 tokens/s in Low Power Mode), so it answers in
+     plain lines (`LINES`, read by `LineStream`), a third of the JSON: `seeing`, then per door
+     `kind | box | detail it | detail en | link | English Wikipedia title | photo search`. The link
+     ("why") is written before the title, which makes the choice better, and is never shown; the
+     prompt carries examples of good doors. English titles have one meaning (an Italian one,
+     "Costolone", led to architecture): `in_italian` finds the Italian article through Wikipedia's
+     interlanguage link, else the English one is shown. No hook: `open_door` shows Wikipedia's first
+     sentence (a local model's facts are not trusted). While someone waits: 5 doors, ~10-14 s, first
+     door ~3-7 s. Prepared ahead (`deep`): 8 candidates, then `pick`, a text-only second look that
+     keeps the 5 most specific and surprising (~15-22 s, unseen). Tried 2026-11: qwen3-vl:8b (weak,
+     invents text), qwen3-vl:30b-a3b (65-220 s, invents more), gemma4 with thinking (minutes), gemma4
+     in JSON with hooks (25-35 s): the lines win.
    - `GeminiCurator` (`CURATOR=gemini`): Interactions API, `stream: true`, `store: false`; free only
      on a project without billing (2026-11: the key's project was prepaid and every picture cost; on
      402/429 it stops asking for 15 min). `thinking_level` low while the person waits, `GEMINI_THINKING`
@@ -158,7 +164,9 @@ picture being worked out is followed, never asked for twice; finished ones are c
    by relevance + beauty + 0.02 for curated. Then the door is sent again `ready`, or `drop`ped.
 4. `farthest`: the door scrolling takes = lowest CLIP text similarity to the concepts met, +0.05 for
    altrove/scala. The frontend prepares it ahead once the picture is done.
-Timing with gemma4: picture at once, `seeing` ~5 s, first door ~10 s, all ~25-35 s.
+Timing with gemma4: picture at once, `seeing` ~2-5 s, first door ~3-7 s, all ~12-25 s with pictures.
+The local model works on one picture at a time: a picture someone waits for stops the ones only being
+prepared ahead (`FlowRun.warm`, `task.cancel()`; Ollama stops when the request closes).
 
 Frontend (`Flow`, `Stimulus` in App.jsx): each picture is a spread, the picture on the left (sticky,
 as large as the screen allows, with what the curator sees and the credits under it) and on the right

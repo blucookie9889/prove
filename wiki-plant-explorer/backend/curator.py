@@ -40,7 +40,7 @@ SIDE = 1024  # long side of the image sent to the model
 
 LEAPS = ["dentro", "perché", "altrove", "storia", "scala"]
 
-SYSTEM = """You are the curator of a visual encyclopedia for one curious, demanding person. They look at a \
+GUIDE = """You are the curator of a visual encyclopedia for one curious, demanding person. They look at a \
 picture; you see what in it is genuinely worth knowing, and open doors from it.
 
 Each door starts from one specific thing that is visible in the picture (give its box) and leads to one \
@@ -77,7 +77,10 @@ What makes a good door:
 - If the picture shows something famous (a species, a building, an artwork), you may use it, but the \
   best doors usually come from details and from what they mean.
 
-Be brief: anchor 2-5 words (anchor_en: the same detail in plain English, as a photo caption would name \
+"""
+
+# How the cloud models answer: JSON with the schema below.
+SYSTEM = GUIDE + """Be brief: anchor 2-5 words (anchor_en: the same detail in plain English, as a photo caption would name \
 it: "engraved name plate", "moss between bricks"), hook at most 18 words, image_query at most 6 words, seeing one short sentence.
 
 The person reads Italian. Write anchor, title and hook in Italian. Give the article title exactly as it \
@@ -85,6 +88,22 @@ is on Italian Wikipedia when that article exists (else an empty string) and exac
 Wikipedia. image_query is an English search for a single striking photograph of the concept itself \
 (concrete and visual: "water droplets on lotus leaf macro", "Fibonacci spiral sunflower head"), not of \
 this picture."""
+
+# How the local model answers: plain lines, a third of the JSON's length (writing is where its time
+# goes), with examples of the doors wanted. No hook: the one shown is Wikipedia's.
+LINES = GUIDE + """Answer in plain lines and nothing else, no JSON, no lists, no comments.
+Line 1: what the picture shows, one short sentence in Italian.
+Then one line per door, seven fields separated by " | ", in this order:
+kind | box as x0 y0 x1 y1, integers 0-1000 | the detail, 2-5 Italian words | the same detail, 2-5 plain \
+English words | the link: why this detail leads to that concept, 5-12 Italian words | the concept's \
+article title exactly as on English Wikipedia | an English search, at most 6 words, for one striking photograph of the concept itself
+
+Examples of the doors wanted (from other pictures):
+perché | 120 80 380 300 | gocce sulla foglia | water drops on a leaf | la cera a microscopiche punte fa rotolare l'acqua | Lotus effect | water droplets lotus leaf macro
+altrove | 410 280 590 590 | catarifrangente nell'asfalto | road cat's eye | gli occhi dei gatti riflettono la luce allo stesso modo | Tapetum lucidum | cat eyes glowing in the dark
+altrove | 600 460 760 660 | nervature che si dividono | branching leaf veins | rami e vasi si dividono con la stessa regola del raggio | Murray's law | river delta branching aerial
+dentro | 300 200 700 650 | spirale della conchiglia | spiral shell | cresce senza cambiare forma, ogni giro più largo | Logarithmic spiral | nautilus shell cross section
+Never broad topics like Fotosintesi, Acciaio, Ingegneria civile, Urbanistica, Ombra, Foglia: the precise phenomenon."""
 
 SCHEMA = {
     "type": "object",
@@ -119,13 +138,13 @@ SCHEMA = {
 }
 
 
-def context_text(name: str, via: Optional[str], seen: list[str]) -> str:
+def context_text(name: str, via: Optional[str], seen: list[str], doors: int = DOORS) -> str:
     lines = [f"Picture: {name}."]
     if via:
         lines.append(f"The person arrived at this picture through the concept: {via}.")
     if seen:
         lines.append("Concepts already met (do not lead back to them or near variants): " + "; ".join(seen[-60:]) + ".")
-    lines.append(f"Open up to {DOORS} doors, each from a different detail. Each box (x0, y0, x1, y1) tightly frames that detail, "
+    lines.append(f"Open up to {doors} doors, each from a different detail. Each box (x0, y0, x1, y1) tightly frames that detail, "
                  "as integers from 0 to 1000 relative to the picture's width and height.")
     return "\n".join(lines)
 
@@ -306,7 +325,6 @@ class LocalCurator(Engine):
         self.url = url.rstrip("/")
         self.model = model
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=5))
-        self.structured = True  # Ollama's MLX runner (Gemma 4) has no structured output: the schema goes in the prompt
 
     async def available(self) -> bool:
         try:
@@ -322,11 +340,54 @@ class LocalCurator(Engine):
         except httpx.HTTPError as exc:
             log.warning("local curator: could not load %s: %s", self.model, exc)
 
+    CANDIDATES = 8  # doors asked for when the picture is prepared ahead, of which ``pick`` keeps DOORS
+
     async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
                      deep: bool = True) -> AsyncIterator[tuple[str, object]]:
-        text = context_text(name, via, seen)
-        if not self.structured:
-            text += "\nAnswer with one JSON object only, no other text, following this JSON schema:\n" + json.dumps(SCHEMA)
+        """While someone waits: DOORS doors, streamed. Prepared ahead (``deep``): CANDIDATES doors, then
+        a second, text-only look keeps the most surprising and precise (about 5 s more, unseen)."""
+        if not deep:
+            async for event in self.lines(image, name, via, seen, DOORS):
+                yield event
+            return
+        seeing, doors = "", []
+        async for kind, value in self.lines(image, name, via, seen, self.CANDIDATES):
+            if kind == "seeing":
+                seeing = value
+            else:
+                doors.append(value)
+        if seeing:
+            yield "seeing", seeing
+        for d in await self.pick(seeing, doors):
+            yield "door", d
+
+    async def pick(self, seeing: str, doors: list[dict]) -> list[dict]:
+        """The DOORS best of ``doors``, best first, chosen by the same model from their words alone."""
+        if len(doors) <= DOORS:
+            return doors
+        listed = "\n".join(f"{i + 1}. {d['anchor']} -> {d['title']} ({d.get('link', '')})" for i, d in enumerate(doors))
+        body = {
+            "model": self.model, "stream": False, "think": False, "keep_alive": self.KEEP,
+            "options": {"temperature": 0.2, "num_predict": 40},
+            "messages": [{"role": "user", "content":
+                f"A picture shows: {seeing}\nCandidate doors from its details to Wikipedia concepts:\n{listed}\n\n"
+                f"Pick the {DOORS} a curious, demanding person would most want to open: true, specific and "
+                "surprising, from different details and fields. Reject broad textbook topics, places, wrong or "
+                "far-fetched links, and near duplicates. Answer only with their numbers, best first, comma-separated."}],
+        }
+        try:
+            resp = await self.http.post(f"{self.url}/api/chat", json=body)
+            resp.raise_for_status()
+            nums = [int(n) - 1 for n in re.findall(r"\d+", resp.json()["message"]["content"])]
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            log.warning("local curator: pick failed: %s", exc)
+            return doors[:DOORS]
+        chosen = [doors[i] for i in dict.fromkeys(nums) if 0 <= i < len(doors)][:DOORS]
+        log.info("local curator: kept %s of %d", [d["title"] for d in chosen], len(doors))
+        return chosen or doors[:DOORS]
+
+    async def lines(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
+                    doors: int) -> AsyncIterator[tuple[str, object]]:
         body = {
             "model": self.model,
             "stream": True,
@@ -334,24 +395,16 @@ class LocalCurator(Engine):
             "keep_alive": self.KEEP,
             "options": {"temperature": 0.6, "num_ctx": 8192},
             "messages": [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": text, "images": [jpeg_b64(image, self.SIDE)]},
+                {"role": "system", "content": LINES},
+                {"role": "user", "content": context_text(name, via, seen, doors), "images": [jpeg_b64(image, self.SIDE)]},
             ],
         }
-        if self.structured:
-            body["format"] = SCHEMA
-        answer = AnswerStream()
+        answer = LineStream()
         last: dict = {}
         try:
             async with self.http.stream("POST", f"{self.url}/api/chat", json=body) as resp:
                 if resp.status_code != 200:
                     text = (await resp.aread()).decode(errors="replace")
-                    if resp.status_code == 501 and self.structured and "structured output" in text:
-                        self.structured = False
-                        log.info("local curator: %s has no structured output, the schema goes in the prompt", self.model)
-                        async for event in self.stream(image, name, via, seen, deep):
-                            yield event
-                        return
                     log.warning("local curator: HTTP %s for %s: %s", resp.status_code, name, text[:300])
                     return
                 async for line in resp.aiter_lines():
@@ -359,17 +412,60 @@ class LocalCurator(Engine):
                         last = json.loads(line)
                     except ValueError:
                         continue
-                    for kind, value in answer.feed((last.get("message") or {}).get("content", "")):
-                        if kind == "door":
-                            # A local model picks good details and concepts but invents facts in its
-                            # hooks: an empty hook makes the grounding show Wikipedia's first sentence
-                            value["hook"] = ""
-                        yield kind, value
+                    for event in answer.feed((last.get("message") or {}).get("content", "")):
+                        yield event
+                    if last.get("done"):
+                        for event in answer.feed("\n"):
+                            yield event
         except httpx.HTTPError as exc:
             log.warning("local curator failed for %s: %s", name, exc)
             return
         log.info("local curator %s: %s in / %s out tokens, %.1fs (load %.1fs)", name, last.get("prompt_eval_count"),
                  last.get("eval_count"), (last.get("total_duration") or 0) / 1e9, (last.get("load_duration") or 0) / 1e9)
+
+
+class LineStream:
+    """Reads the local curator's plain lines while they are written: the first line is what it sees
+    (sent as it grows), each later line with six or seven " | " fields is a door."""
+
+    def __init__(self):
+        self.buf = ""
+        self.seeing: Optional[str] = None  # None until its line is complete
+
+    def feed(self, chunk: str) -> list[tuple[str, object]]:
+        self.buf += chunk
+        events: list[tuple[str, object]] = []
+        *lines, self.buf = self.buf.split("\n")
+        for line in lines:
+            line = line.strip().strip("`*-•").strip()
+            if not line:
+                continue
+            if self.seeing is None and "|" not in line:
+                self.seeing = line
+                events.append(("seeing", line))
+            elif (door := self.door(line)) is not None:
+                events.append(("door", door))
+        if self.seeing is None and self.buf.strip() and "|" not in self.buf:
+            events.append(("seeing", self.buf.strip().strip("`*").strip()))
+        return events
+
+    @staticmethod
+    def door(line: str) -> Optional[dict]:
+        f = [x.strip() for x in line.split("|")]
+        if len(f) < 6:  # the photo search is sometimes left out: the title stands in for it
+            return None
+        f += [""] * (7 - len(f))
+        nums = re.findall(r"-?\d+(?:\.\d+)?", f[1])
+        if len(nums) != 4:
+            return None
+        # f[4] is the link the model writes before choosing the concept: it makes the choice better
+        # (and the second look, ``pick``), and is not shown (a local model's facts are not trusted)
+        title = f[5].strip(" .\"'")
+        # An English title: one meaning per title, and the Italian article is found from it
+        d = {"leap": f[0].lower(), "anchor": f[2], "anchor_en": f[3], "link": f[4], "wikipedia_it": "", "wikipedia_en": title,
+             "title": title, "hook": "", "image_query": f[6] or title,
+             **dict(zip(("x0", "y0", "x1", "y1"), map(float, nums)))}
+        return normalise_door(d)
 
 
 class Fallback(Engine):

@@ -1241,6 +1241,8 @@ async def wikipedia(it_title: str, en_title: str) -> Optional[dict]:
                          srsearch=title, srlimit=1, srnamespace=0),
             return_exceptions=True)
         if fits(exact):
+            if lang == "en" and not it_title:
+                return await in_italian(exact.get("title") or title) or {"lang": lang, "about": title, **exact}
             return {"lang": lang, "about": title, **exact}
         if isinstance(hits, Exception):
             continue
@@ -1252,8 +1254,27 @@ async def wikipedia(it_title: str, en_title: str) -> Optional[dict]:
             except Exception:  # noqa: BLE001 - no such article
                 continue
             if fits(sm):
+                if lang == "en" and not it_title:
+                    return await in_italian(h["title"]) or {"lang": lang, "about": h["title"], **sm}
                 return {"lang": lang, "about": h["title"], **sm}
     return None
+
+
+async def in_italian(en_title: str) -> Optional[dict]:
+    """The Italian article of an English one (Wikipedia's interlanguage link), if it explains the concept."""
+    commons: Commons = S["commons"]
+    try:
+        data = await commons._get("https://en.wikipedia.org/w/api.php", action="query", titles=en_title,
+                                  prop="langlinks", lllang="it", redirects=1)
+        pages = (data.get("query") or {}).get("pages") or {}
+        pages = pages.values() if isinstance(pages, dict) else pages
+        it_title = next((l.get("title") or l.get("*") for p in pages for l in p.get("langlinks", [])), None)
+        if not it_title:
+            return None
+        sm = await commons.summary("it", it_title)
+    except Exception:  # noqa: BLE001 - no Italian article
+        return None
+    return {"lang": "it", "about": it_title, **sm} if fits(sm) else None
 
 
 def fits(sm) -> bool:
@@ -1271,7 +1292,9 @@ async def ground_article(door: dict) -> Optional[dict]:
     box = [min(1.0, max(0.0, float(door[k]))) for k in ("x0", "y0", "x1", "y1")]
     return {
         "anchor": door["anchor"], "box": box, "dot": [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2],
-        "leap": door["leap"], "title": door["title"], "hook": door["hook"],
+        # The title the local curator gives is the article's (it writes none of its own), so it shows as
+        # Wikipedia writes it, in the language found
+        "leap": door["leap"], "title": door["title"] if door["hook"] else art.get("title") or door["title"], "hook": door["hook"],
         "about": art["about"], "lang": art["lang"], "extract": art["extract"], "url": art.get("url"),
         "lead": art.get("image"), "query": [door["image_query"], door["wikipedia_en"], " ".join(door["image_query"].split()[:2])],
     }
@@ -1343,10 +1366,12 @@ class FlowRun:
     """One picture being worked out: the events so far (item, seeing, door, drop, done), which any
     number of readers follow as they come. A picture being prepared ahead is followed, never redone."""
 
-    def __init__(self):
+    def __init__(self, warm: bool):
         self.events: list[dict] = []
         self.done = False
         self.changed = asyncio.Event()
+        self.warm = warm  # prepared ahead, nobody waiting for it yet
+        self.task: Optional[asyncio.Future] = None
 
     def emit(self, event: dict) -> None:
         self.events.append(event)
@@ -1372,10 +1397,18 @@ class FlowRun:
 
 def flow_run(step: FlowStep) -> FlowRun:
     runs: dict = S.setdefault("flow_runs", {})
+    if not step.warm:
+        # Someone is waiting: the local model works on one picture at a time, so pictures only being
+        # prepared ahead give way (they are asked for again later)
+        for title, other in list(runs.items()):
+            if other.warm and title != step.title and other.task:
+                log.info("flow: stopped preparing %s, someone is waiting for %s", title, step.title)
+                other.task.cancel()
     run = runs.get(step.title)
     if run:
+        run.warm = run.warm and step.warm
         return run
-    run = runs[step.title] = FlowRun()
+    run = runs[step.title] = FlowRun(step.warm)
     cache: OrderedDict = S.setdefault("flow_cache", OrderedDict())
 
     async def work() -> None:
@@ -1402,7 +1435,7 @@ def flow_run(step: FlowStep) -> FlowRun:
             run.changed.set()
             runs.pop(step.title, None)
 
-    asyncio.ensure_future(work())
+    run.task = asyncio.ensure_future(work())
     return run
 
 

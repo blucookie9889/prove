@@ -421,6 +421,7 @@ class Commons:
         path = quote(title.replace(" ", "_"), safe="")
         data = await self._get(f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{path}")
         return {
+            "title": data.get("title") or title,  # as Wikipedia writes it (redirects followed)
             "kind": data.get("type") or "",  # "disambiguation" pages explain nothing
             "description": data.get("description") or "",  # Wikidata's short description
             "extract": data.get("extract") or "",
