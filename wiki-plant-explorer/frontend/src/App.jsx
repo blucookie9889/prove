@@ -425,59 +425,43 @@ const reduceMotion = () => window.matchMedia("(prefers-reduced-motion: reduce)")
 const wide = () => window.matchMedia("(min-width: 1024px)").matches;
 
 /**
- * The veil over a picture that leaves one box clear: four paper-coloured rectangles around it.
- * ``box`` is x0, y0, x1, y1 as fractions of the picture.
+ * The detail a door comes from, brought into focus: the rest of the picture goes soft and pale
+ * under a feathered veil, four corner marks frame the detail and a small note names its door.
+ * No line across the page: the number and the receding rows already say which door it is.
+ * It keeps the last detail while it fades out, and glides from one detail to the next.
  */
-function Veil({ box }) {
-  const [x0, y0, x1, y1] = box || [0, 0, 1, 1];
-  const parts = [
-    { left: 0, top: 0, width: "100%", height: `${y0 * 100}%` },
-    { left: 0, top: `${y1 * 100}%`, width: "100%", height: `${(1 - y1) * 100}%` },
-    { left: 0, top: `${y0 * 100}%`, width: `${x0 * 100}%`, height: `${(y1 - y0) * 100}%` },
-    { left: `${x1 * 100}%`, top: `${y0 * 100}%`, width: `${(1 - x1) * 100}%`, height: `${(y1 - y0) * 100}%` },
-  ];
+function Focus({ door, n }) {
+  const last = useRef(null);
+  if (door?.box) last.current = { door, n };
+  if (!last.current) return null;
+  const { door: d, n: k } = last.current;
+  const [x0, y0, x1, y1] = d.box;
+  // The note goes on the side with more room; inside the frame if neither has any
+  const below = 1 - y1 >= y0;
+  const room = below ? 1 - y1 : y0;
+  const right = x0 > 0.55;
+  const note = {
+    ...(room < 0.1
+      ? { bottom: `calc(${(1 - y1) * 100}% + 8px)` }
+      : below
+        ? { top: `calc(${y1 * 100}% + 8px)` }
+        : { bottom: `calc(${(1 - y0) * 100}% + 8px)` }),
+    ...(right ? { right: `calc(${(1 - x1) * 100}% + ${room < 0.1 ? 8 : 0}px)` } : { left: `calc(${x0 * 100}% + ${room < 0.1 ? 8 : 0}px)` }),
+  };
   return (
-    <span className={`pointer-events-none absolute inset-0 transition-opacity duration-[1200ms] ease-[cubic-bezier(.16,1,.3,1)] ${box ? "opacity-100" : "opacity-0"}`}>
-      {parts.map((st, i) => (
-        <span key={i} className="absolute bg-paper/75 transition-all duration-[900ms] ease-[cubic-bezier(.16,1,.3,1)]" style={st} />
-      ))}
+    <span className={`focus ${door?.box ? "is-on" : ""}`} style={{ "--x0": x0, "--y0": y0, "--x1": x1, "--y1": y1 }} aria-hidden="true">
+      <span className="focus-veil" />
+      <span className="focus-frame">
+        <i />
+        <i />
+        <i />
+        <i />
+      </span>
+      <span key={k} className="focus-note" style={note}>
+        <span className="text-mute">{k + 1}</span>
+        <span className="min-w-0 truncate first-letter:uppercase">{d.title}</span>
+      </span>
     </span>
-  );
-}
-
-/**
- * A hairline from a detail of the picture to the door it opens, drawn in when either is hovered.
- * Only side by side (wide screens): stacked, the list is right under the picture.
- */
-function Connector({ host, from, to, on }) {
-  const [path, setPath] = useState(null);
-  useLayoutEffect(() => {
-    if (!on || !host.current || !from || !to || !wide()) {
-      setPath(null);
-      return;
-    }
-    const h = host.current.getBoundingClientRect();
-    const a = from.getBoundingClientRect();
-    const b = to.getBoundingClientRect();
-    const x1 = a.left + a.width / 2 - h.left;
-    const y1 = a.top + a.height / 2 - h.top;
-    const x2 = b.left - h.left - 12;
-    const y2 = b.top + b.height / 2 - h.top;
-    if (x2 <= x1) {
-      setPath(null);
-      return;
-    }
-    const dx = (x2 - x1) * 0.5;
-    setPath({ d: `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`, x2, y2 });
-  }, [on, host, from, to]);
-  if (!path) return null;
-  return (
-    <svg className="pointer-events-none absolute inset-0 z-10 h-full w-full overflow-visible" aria-hidden="true">
-      {/* a paper halo under the ink line keeps it readable over dark pictures */}
-      <path key={`h${path.d}`} d={path.d} pathLength="1" className="draw text-paper/80" fill="none" stroke="currentColor" strokeWidth="3" />
-      <path key={path.d} d={path.d} pathLength="1" className="draw text-ink/70" fill="none" stroke="currentColor" strokeWidth="1" />
-      <circle key={`c${path.d}`} cx={path.x2} cy={path.y2} r="2" className="fade-in fill-ink/70" />
-    </svg>
   );
 }
 
@@ -507,7 +491,7 @@ function FlowPicture({ item, seeing, doors, hover, setHover, onFollow, dotRefs, 
               />
             </>
           )}
-          <Veil box={hover >= 0 && doors?.[hover] ? doors[hover].box : null} />
+          <Focus door={hover >= 0 ? doors?.[hover] : null} n={hover} />
         </div>
         {(doors || []).map((d, i) => (
           <button
@@ -526,7 +510,7 @@ function FlowPicture({ item, seeing, doors, hover, setHover, onFollow, dotRefs, 
           >
             <span
               className={`block h-2 w-2 rounded-full bg-paper outline outline-1 outline-ink/30 transition-[transform,opacity] duration-[1200ms] ease-[cubic-bezier(.16,1,.3,1)] ${
-                hover === i ? "scale-[1.7] opacity-100" : d.ready ? "breathe" : "opacity-50"
+                hover === i ? "scale-50 opacity-0" : hover >= 0 ? "opacity-30" : d.ready ? "breathe" : "opacity-50"
               }`}
               style={{ animationDelay: `${i * 0.7}s` }}
             />
@@ -661,7 +645,7 @@ function DoorSkeleton({ n }) {
 /**
  * One stimulus as a spread: the picture on the left, on the right the concept that led here
  * (its hook, Wikipedia's explanation) and the doors out of it. A door and its detail answer each
- * other: hovering one clears the detail, draws the line to it and lets the other doors recede.
+ * other: hovering one brings the detail into focus and lets the other doors recede.
  */
 function Stimulus({ entry, first, active, dive, onFollow, onSave, sectionRef }) {
   const [hover, setHover] = useState(-1);
@@ -772,7 +756,6 @@ function Stimulus({ entry, first, active, dive, onFollow, onSave, sectionRef }) 
         </div>
       </aside>
 
-      <Connector host={host} from={dotRefs.current[hover]} to={thumbRefs.current[hover]} on={hover >= 0} />
     </section>
   );
 }

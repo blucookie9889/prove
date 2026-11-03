@@ -134,14 +134,78 @@ a:hover,
   50% { opacity: 0.2; }
 }
 
-/* A hairline drawing itself in (SVG paths with pathLength="1") */
-.draw {
-  stroke-dasharray: 1;
-  stroke-dashoffset: 1;
-  animation: draw 0.9s var(--ease-calm) forwards;
+/* A detail of the picture in focus. The box is registered so it glides between details,
+   and the veil's feathered hole and the corner marks follow it on every frame. */
+@property --x0 { syntax: "<number>"; inherits: true; initial-value: 0; }
+@property --y0 { syntax: "<number>"; inherits: true; initial-value: 0; }
+@property --x1 { syntax: "<number>"; inherits: true; initial-value: 1; }
+@property --y1 { syntax: "<number>"; inherits: true; initial-value: 1; }
+.focus {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.9s var(--ease-calm), --x0 0.9s var(--ease-calm), --y0 0.9s var(--ease-calm),
+    --x1 0.9s var(--ease-calm), --y1 0.9s var(--ease-calm);
 }
-@keyframes draw {
-  to { stroke-dashoffset: 0; }
+.focus.is-on {
+  opacity: 1;
+}
+.focus-veil {
+  position: absolute;
+  inset: 0;
+  background: rgb(250 249 246 / 0.55);
+  -webkit-backdrop-filter: blur(5px) saturate(0.4);
+  backdrop-filter: blur(5px) saturate(0.4);
+  --hole: radial-gradient(
+    ellipse calc((var(--x1) - var(--x0)) * 90%) calc((var(--y1) - var(--y0)) * 90%)
+      at calc((var(--x0) + var(--x1)) * 50%) calc((var(--y0) + var(--y1)) * 50%),
+    transparent 78%,
+    #000 100%
+  );
+  -webkit-mask-image: var(--hole);
+  mask-image: var(--hole);
+}
+.focus-frame {
+  position: absolute;
+  left: calc(var(--x0) * 100%);
+  top: calc(var(--y0) * 100%);
+  width: calc((var(--x1) - var(--x0)) * 100%);
+  height: calc((var(--y1) - var(--y0)) * 100%);
+  filter: drop-shadow(0 0 1px rgb(29 28 26 / 0.35));
+  transform: scale(1.06);
+  transition: transform 0.9s var(--ease-calm);
+}
+.focus.is-on .focus-frame {
+  transform: none;
+}
+.focus-frame > i {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border: 0 solid #fff;
+}
+.focus-frame > i:nth-child(1) { left: 0; top: 0; border-width: 1.5px 0 0 1.5px; }
+.focus-frame > i:nth-child(2) { right: 0; top: 0; border-width: 1.5px 1.5px 0 0; }
+.focus-frame > i:nth-child(3) { left: 0; bottom: 0; border-width: 0 0 1.5px 1.5px; }
+.focus-frame > i:nth-child(4) { right: 0; bottom: 0; border-width: 0 1.5px 1.5px 0; }
+.focus-note {
+  position: absolute;
+  display: flex;
+  gap: 8px;
+  max-width: 70%;
+  padding: 2px 9px;
+  border-radius: 2px;
+  background: rgb(250 249 246 / 0.88);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  color: var(--color-ink);
+  line-height: 1.5;
+  white-space: nowrap;
+  animation: note-in 0.9s var(--ease-calm) both;
+}
+@keyframes note-in {
+  from { opacity: 0; transform: translateY(3px); filter: blur(4px); }
 }
 
 /* Diving into a door: its little picture grows into the next spread */
@@ -233,7 +297,7 @@ input::placeholder {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .rise, .fade-in, .breathe, .draw, .open-in { animation: none; }
-  .draw { stroke-dashoffset: 0; }
+  .rise, .fade-in, .breathe, .open-in, .focus-note { animation: none; }
+  .focus, .focus-frame { transition: opacity 0.3s; }
   .fold, .fold > div > *, .recede > *, .plus::after, a, .link { transition: none; }
 }
