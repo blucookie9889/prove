@@ -121,6 +121,7 @@ PAGES_CACHED = 32
 # door is checked against the picture, grounded in its Wikipedia article and shown with the best
 # picture of it that the person has not seen yet.
 LOCAL_MODEL = "gemma4:26b-a4b"  # Ollama model of the local curator (OLLAMA_MODEL in .env overrides it)
+GEMINI_MODELS = "gemini-3.8-flash,gemini-3.5-flash-lite"  # best first; the next when one is busy
 FLOW_CACHED = 64
 # A door must point at something: its box is not the whole picture, not the same detail as a door
 # already open, and the crop (grown by DOOR_PAD) is not clearly less like the named detail than the
@@ -195,7 +196,7 @@ async def lifespan(_: FastAPI):
         local = None
     S["curator"] = local
     if choice == "gemini" and env.get("GEMINI_API_KEY"):
-        S["curator"] = Fallback(GeminiCurator(env["GEMINI_API_KEY"], env.get("GEMINI_MODEL", "gemini-3.8-flash"),
+        S["curator"] = Fallback(GeminiCurator(env["GEMINI_API_KEY"], env.get("GEMINI_MODEL", GEMINI_MODELS),
                                               env.get("GEMINI_THINKING", "medium")), local)
     elif choice == "claude" and env.get("ANTHROPIC_API_KEY"):
         S["curator"] = Fallback(Curator(env["ANTHROPIC_API_KEY"]), local)

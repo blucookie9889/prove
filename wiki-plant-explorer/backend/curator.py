@@ -10,10 +10,11 @@ Three engines, same prompt and schema (``CURATOR`` in .env picks one; default ``
   - ``LocalCurator``: an open vision-language model on this Mac through Ollama (``OLLAMA_MODEL`` /
     ``OLLAMA_URL``). Free, and nothing leaves the computer. The default and the only one used unless
     another is chosen explicitly.
-  - ``GeminiCurator`` (``CURATOR=gemini``): Google Gemini (default ``gemini-3.8-flash``) with an AI Studio
-    key (``GEMINI_API_KEY``). Free only on a project without billing: on a paid or prepaid project every
-    picture costs. Sent with ``store: false``. It stops asking for a while after "payment required" or
-    "quota exhausted".
+  - ``GeminiCurator`` (``CURATOR=gemini``): Google Gemini with an AI Studio key (``GEMINI_API_KEY``);
+    ``GEMINI_MODEL`` lists models best first (default ``gemini-3.8-flash,gemini-3.5-flash-lite``), and
+    when one is overloaded or out of quota the next answers. Free only on a project without billing: on
+    a paid or prepaid project every picture costs. Sent with ``store: false``. It stops asking for a
+    while after "payment required", and skips a model for a while after "quota exhausted".
   - ``Curator`` (``CURATOR=claude``): Claude through the Anthropic API (paid, needs ANTHROPIC_API_KEY).
 The image is sent in memory as base64; nothing is stored.
 """
@@ -492,16 +493,38 @@ class GeminiCurator(Engine):
 
     URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
-    def __init__(self, api_key: str, model: str, thinking: str = "medium"):
-        self.model = model
+    def __init__(self, api_key: str, models: str, thinking: str = "medium"):
+        # Best first: when one is overloaded (503) or out of quota (429), the next one answers
+        self.models = [m.strip() for m in models.split(",") if m.strip()]
+        self.model = " > ".join(self.models)
         self.thinking = thinking  # medium: 30-70 s and the richest doors; low: ~9 s, more obvious doors
         self.http = httpx.AsyncClient(timeout=120, headers={"x-goog-api-key": api_key})
-        self.off_until = 0.0  # after "payment required" / "quota exhausted": stop asking for a while
+        self.off_until = 0.0  # after "payment required": stop asking for a while
+        self.rested: dict[str, float] = {}  # model -> until when it is out of quota
 
     async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
                      deep: bool = True) -> AsyncIterator[tuple[str, object]]:
+        for model in self.models:
+            if time.time() < self.off_until:
+                return
+            if time.time() < self.rested.get(model, 0):
+                continue
+            answered = False
+            async for event in self.ask(model, image, name, via, seen, deep):
+                if event == ("busy", None):
+                    break
+                answered = True
+                yield event
+            else:
+                return
+            if answered:
+                return
+
+    async def ask(self, model: str, image: Image.Image, name: str, via: Optional[str], seen: list[str],
+                  deep: bool) -> AsyncIterator[tuple[str, object]]:
+        """One model's answer; ("busy", None) alone when it is overloaded or out of quota."""
         body = {
-            "model": self.model,
+            "model": model,
             "store": False,
             "stream": True,
             "system_instruction": SYSTEM,
@@ -512,8 +535,6 @@ class GeminiCurator(Engine):
             "response_format": {"type": "text", "mime_type": "application/json", "schema": SCHEMA},
             "generation_config": {"thinking_level": self.thinking if deep else "low"},  # low while someone waits
         }
-        if time.time() < self.off_until:
-            return
         answer = AnswerStream()
         usage: dict = {}
         try:
@@ -521,9 +542,13 @@ class GeminiCurator(Engine):
                 if resp.status_code != 200:
                     text = (await resp.aread()).decode(errors="replace")
                     level = log.error if resp.status_code in (400, 401, 402, 403) else log.warning
-                    level("gemini curator: HTTP %s for %s: %s", resp.status_code, name, text[:300])
-                    if resp.status_code in (402, 429):
+                    level("gemini curator: %s: HTTP %s for %s: %s", model, resp.status_code, name, text[:300])
+                    if resp.status_code == 402:
                         self.off_until = time.time() + 15 * 60
+                    elif resp.status_code == 429:
+                        self.rested[model] = time.time() + 15 * 60
+                    if resp.status_code in (429, 500, 503, 504):
+                        yield ("busy", None)
                     return
                 # Server-sent events: "data: {...}" lines; the text arrives in step.delta events.
                 async for line in resp.aiter_lines():
@@ -544,5 +569,5 @@ class GeminiCurator(Engine):
         except httpx.HTTPError as exc:
             log.warning("gemini curator: connection error: %s", exc)
             return
-        log.info("gemini curator %s: %s in / %s out / %s thinking tokens%s", name, usage.get("total_input_tokens"),
+        log.info("gemini curator %s, %s: %s in / %s out / %s thinking tokens%s", model, name, usage.get("total_input_tokens"),
                  usage.get("total_output_tokens"), usage.get("total_thought_tokens"), "" if deep else " (quick)")
