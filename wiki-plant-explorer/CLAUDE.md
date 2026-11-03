@@ -174,9 +174,11 @@ Frontend (`Flow`, `Stimulus` in App.jsx): each picture is a spread, the picture 
 as large as the screen allows, with what the curator sees and the credits under it) and on the right
 the concept that led here (leap · detail, title, hook, Wikipedia's extract clamped) and "Da qui": the
 doors as rows (thumbnail, number, leap · detail, title, hook; ↓ marks the one scrolling takes;
-skeleton rows while they arrive). A door and its dot answer each other on hover: the veil clears its
-detail, a hairline (`Connector`, wide screens only) draws itself from the dot to the row, the other
-rows recede. Clicking dives in: the row's thumbnail grows into the next spread (View Transition
+skeleton rows while they arrive). A door and its dot answer each other on hover: the picture dims and
+greys, its detail lifts off it (`Lift`: an undimmed crop, raised 4% with a soft shadow, the door's
+number and title on a tag), the other rows recede. One lift for all details: its box is four
+registered CSS properties, so moving between doors it glides on a soft spring (`--ease-settle`).
+No line across the page. Clicking dives in: the row's thumbnail grows into the next spread (View Transition
 `dive`). Keys: 1-9 open that door of the spread in view, → the one scrolling would take. The next
 spread is added when the end is within 160 px, so pictures are not worked out in a cascade.
 

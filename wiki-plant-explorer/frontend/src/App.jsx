@@ -425,40 +425,28 @@ const reduceMotion = () => window.matchMedia("(prefers-reduced-motion: reduce)")
 const wide = () => window.matchMedia("(min-width: 1024px)").matches;
 
 /**
- * The detail a door comes from, brought into focus: the rest of the picture goes soft and pale
- * under a feathered veil, four corner marks frame the detail and a small note names its door.
+ * The detail a door comes from, lifted off the picture: the picture dims and loses its colour, the
+ * detail stays as it is, rises a little as under a loupe, and carries the door's name on a tag.
  * No line across the page: the number and the receding rows already say which door it is.
- * It keeps the last detail while it fades out, and glides from one detail to the next.
+ * One lift for all the details, so moving between doors it glides from one to the next; leaving,
+ * it settles back where it was.
  */
-function Focus({ door, n }) {
+function Lift({ door, n, src }) {
   const last = useRef(null);
   if (door?.box) last.current = { door, n };
-  if (!last.current) return null;
+  if (!last.current || !src) return null;
   const { door: d, n: k } = last.current;
   const [x0, y0, x1, y1] = d.box;
-  // The note goes on the side with more room; inside the frame if neither has any
-  const below = 1 - y1 >= y0;
-  const room = below ? 1 - y1 : y0;
+  const below = 1 - y1 >= y0; // the tag goes on the side with more room
   const right = x0 > 0.55;
-  const note = {
-    ...(room < 0.1
-      ? { bottom: `calc(${(1 - y1) * 100}% + 8px)` }
-      : below
-        ? { top: `calc(${y1 * 100}% + 8px)` }
-        : { bottom: `calc(${(1 - y0) * 100}% + 8px)` }),
-    ...(right ? { right: `calc(${(1 - x1) * 100}% + ${room < 0.1 ? 8 : 0}px)` } : { left: `calc(${x0 * 100}% + ${room < 0.1 ? 8 : 0}px)` }),
-  };
   return (
-    <span className={`focus ${door?.box ? "is-on" : ""}`} style={{ "--x0": x0, "--y0": y0, "--x1": x1, "--y1": y1 }} aria-hidden="true">
-      <span className="focus-veil" />
-      <span className="focus-frame">
-        <i />
-        <i />
-        <i />
-        <i />
+    <span className={`lift ${door?.box ? "is-on" : ""}`} style={{ "--x0": x0, "--y0": y0, "--x1": x1, "--y1": y1 }} aria-hidden="true">
+      <span className="lift-detail">
+        <img src={src} alt="" />
       </span>
-      <span key={k} className="focus-note" style={note}>
-        <span className="text-mute">{k + 1}</span>
+      {/* A new tag per door: it appears where its detail lands, instead of sliding across the picture */}
+      <span key={k} className={`lift-tag ${below ? "is-below" : "is-above"} ${right ? "is-right" : ""}`}>
+        <span className="text-mute tabular-nums">{k + 1}</span>
         <span className="min-w-0 truncate first-letter:uppercase">{d.title}</span>
       </span>
     </span>
@@ -479,7 +467,7 @@ function FlowPicture({ item, seeing, doors, hover, setHover, onFollow, dotRefs, 
         className="relative w-[min(100%,calc(68svh*var(--r)))] lg:w-[min(100%,calc((100svh-210px)*var(--r)))]"
         style={{ "--r": ratio, aspectRatio: `${ratio}`, viewTransitionName: name }}
       >
-        <div className="placeholder absolute inset-0 overflow-hidden rounded-[2px]">
+        <div className="placeholder picture-base absolute inset-0 overflow-hidden rounded-[2px]" data-dim={hover >= 0 && Boolean(doors?.[hover]?.box)}>
           {item?.thumb && (
             <>
               <img src={item.thumb} alt={item.name} className="h-full w-full object-cover" />
@@ -491,8 +479,8 @@ function FlowPicture({ item, seeing, doors, hover, setHover, onFollow, dotRefs, 
               />
             </>
           )}
-          <Focus door={hover >= 0 ? doors?.[hover] : null} n={hover} />
         </div>
+        <Lift door={hover >= 0 ? doors?.[hover] : null} n={hover} src={bigLoaded ? big : item?.thumb} />
         {(doors || []).map((d, i) => (
           <button
             key={d.id}

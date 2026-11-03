@@ -21,6 +21,7 @@ The image is sent in memory as base64; nothing is stored.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -493,14 +494,20 @@ class GeminiCurator(Engine):
 
     URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
+    # Seconds a model has to say anything (the first sentence comes in 2-5 s when it is not
+    # overloaded) before the next one is asked: while someone waits, and for a picture prepared ahead.
+    FIRST_WORD = 9
+    FIRST_WORD_AHEAD = 30
+    BUSY_REST = 3 * 60  # an overloaded model is not asked again for this long
+
     def __init__(self, api_key: str, models: str, thinking: str = "medium"):
-        # Best first: when one is overloaded (503) or out of quota (429), the next one answers
+        # Best first: when one is overloaded (503), slow to start or out of quota (429), the next answers
         self.models = [m.strip() for m in models.split(",") if m.strip()]
         self.model = " > ".join(self.models)
         self.thinking = thinking  # medium: 30-70 s and the richest doors; low: ~9 s, more obvious doors
         self.http = httpx.AsyncClient(timeout=120, headers={"x-goog-api-key": api_key})
         self.off_until = 0.0  # after "payment required": stop asking for a while
-        self.rested: dict[str, float] = {}  # model -> until when it is out of quota
+        self.rested: dict[str, float] = {}  # model -> until when it is overloaded or out of quota
 
     async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
                      deep: bool = True) -> AsyncIterator[tuple[str, object]]:
@@ -509,16 +516,25 @@ class GeminiCurator(Engine):
                 return
             if time.time() < self.rested.get(model, 0):
                 continue
-            answered = False
-            async for event in self.ask(model, image, name, via, seen, deep):
-                if event == ("busy", None):
-                    break
-                answered = True
-                yield event
-            else:
-                return
-            if answered:
-                return
+            answer = self.ask(model, image, name, via, seen, deep)
+            try:
+                first = await asyncio.wait_for(answer.__anext__(), self.FIRST_WORD_AHEAD if deep else self.FIRST_WORD)
+            except StopAsyncIteration:
+                return  # answered nothing for another reason (logged): the local model's turn
+            except asyncio.TimeoutError:
+                log.warning("gemini curator: %s said nothing in time for %s, asking the next", model, name)
+                self.rested[model] = time.time() + self.BUSY_REST
+                await answer.aclose()
+                continue
+            if first == ("busy", None):
+                self.rested[model] = max(self.rested.get(model, 0), time.time() + self.BUSY_REST)
+                await answer.aclose()
+                continue
+            yield first
+            async for event in answer:
+                if event != ("busy", None):
+                    yield event
+            return
 
     async def ask(self, model: str, image: Image.Image, name: str, via: Optional[str], seen: list[str],
                   deep: bool) -> AsyncIterator[tuple[str, object]]:
@@ -546,7 +562,7 @@ class GeminiCurator(Engine):
                     if resp.status_code == 402:
                         self.off_until = time.time() + 15 * 60
                     elif resp.status_code == 429:
-                        self.rested[model] = time.time() + 15 * 60
+                        self.rested[model] = time.time() + 15 * 60  # out of quota: longer than busy
                     if resp.status_code in (429, 500, 503, 504):
                         yield ("busy", None)
                     return
@@ -565,7 +581,11 @@ class GeminiCurator(Engine):
                     elif kind == "interaction.completed":
                         usage = (ev.get("interaction") or {}).get("usage") or {}
                     elif kind == "error":
-                        log.warning("gemini curator: error for %s: %s", name, str(ev)[:300])
+                        log.warning("gemini curator: %s: error for %s: %s", model, name, str(ev)[:300])
+                        if answer.text:  # part of an answer came: keep it
+                            return
+                        yield ("busy", None)  # overloaded after accepting the request: the next one
+                        return
         except httpx.HTTPError as exc:
             log.warning("gemini curator: connection error: %s", exc)
             return
