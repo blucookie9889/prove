@@ -247,6 +247,10 @@ class Engine:
                     deep: bool = True) -> Optional[dict]:
         raise NotImplementedError
 
+    async def say(self, prompt: str) -> Optional[str]:
+        """A short text answer to ``prompt`` (no picture), or None. Used for the recap of a journey."""
+        return None
+
     async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
                      deep: bool = True) -> AsyncIterator[tuple[str, object]]:
         """("seeing", text) and ("door", door) as they become known. Engines that cannot stream
@@ -388,6 +392,20 @@ class LocalCurator(Engine):
         log.info("local curator: kept %s of %d", [d["title"] for d in chosen], len(doors))
         return chosen or doors[:DOORS]
 
+    async def say(self, prompt: str) -> Optional[str]:
+        body = {
+            "model": self.model, "stream": False, "think": False, "keep_alive": self.KEEP,
+            "options": {"temperature": 0.6, "num_predict": 260},
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            resp = await self.http.post(f"{self.url}/api/chat", json=body)
+            resp.raise_for_status()
+            return resp.json()["message"]["content"].strip() or None
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            log.warning("local curator: say failed: %s", exc)
+            return None
+
     async def lines(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
                     doors: int) -> AsyncIterator[tuple[str, object]]:
         body = {
@@ -488,6 +506,12 @@ class Fallback(Engine):
             async for event in self.then.stream(image, name, via, seen, deep):
                 yield event
 
+    async def say(self, prompt: str) -> Optional[str]:
+        text = await self.first.say(prompt)
+        if not text and self.then:
+            text = await self.then.say(prompt)
+        return text
+
 
 class GeminiCurator(Engine):
     """The same curator on Google Gemini through the Interactions API: free with an AI Studio key."""
@@ -535,6 +559,47 @@ class GeminiCurator(Engine):
                 if event != ("busy", None):
                     yield event
             return
+
+    async def say(self, prompt: str) -> Optional[str]:
+        for model in self.models:
+            if time.time() < self.off_until:
+                return None
+            if time.time() < self.rested.get(model, 0):
+                continue
+            try:
+                text = await asyncio.wait_for(self.say_once(model, prompt), 30)
+            except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+                log.warning("gemini curator: %s: recap failed: %s", model, exc or "timeout")
+                self.rested[model] = time.time() + self.BUSY_REST
+                continue
+            if text:
+                return text
+        return None
+
+    async def say_once(self, model: str, prompt: str) -> Optional[str]:
+        """One model's text answer; None (and the model rested) when it is overloaded."""
+        body = {"model": model, "store": False, "stream": True, "input": [{"type": "text", "text": prompt}],
+                "generation_config": {"thinking_level": "low"}}
+        text = ""
+        async with self.http.stream("POST", self.URL, json=body) as resp:
+            if resp.status_code != 200:
+                log.warning("gemini curator: %s: HTTP %s for a recap", model, resp.status_code)
+                if resp.status_code in (429, 500, 503, 504):
+                    self.rested[model] = time.time() + self.BUSY_REST
+                return None
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    ev = json.loads(line[5:])
+                except ValueError:
+                    continue
+                if ev.get("event_type") == "step.delta" and (ev.get("delta") or {}).get("type") == "text":
+                    text += ev["delta"].get("text", "")
+                elif ev.get("event_type") == "error" and not text:
+                    self.rested[model] = time.time() + self.BUSY_REST
+                    return None
+        return text.strip() or None
 
     async def ask(self, model: str, image: Image.Image, name: str, via: Optional[str], seen: list[str],
                   deep: bool) -> AsyncIterator[tuple[str, object]]:

@@ -7,10 +7,10 @@ const SEARCH_BUDGET = 72;
 // Cards that get their own view-transition name, so they glide to their new place on re-rank.
 const ANIMATED_CARDS = 40;
 
-async function api(path, { signal, body } = {}) {
+async function api(path, { signal, body, method } = {}) {
   const res = await fetch(`/api${path}`, {
     signal,
-    method: body ? "POST" : "GET",
+    method: method || (body ? "POST" : "GET"),
     headers: body ? { "content-type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -40,6 +40,8 @@ function readRoute() {
   const p = new URLSearchParams(window.location.search);
   const start = p.get("flow") || p.get("file"); // ?file= is the old image page: it opens the flow now
   if (start) return { view: "flow", file: start, q: "" };
+  if (p.get("journey")) return { view: "journey", id: p.get("journey"), q: "" };
+  if (p.get("view") === "diary") return { view: "diary", q: "" };
   if (p.get("view") === "saved") return { view: "saved", q: "" };
   if (p.get("view") === "featured") return { view: "featured", q: "" };
   if (p.get("q")) return { view: "search", q: p.get("q") };
@@ -49,7 +51,8 @@ function readRoute() {
 function routeUrl(r) {
   const p = new URLSearchParams();
   if (r.view === "flow") p.set("flow", r.file);
-  else if (r.view === "saved" || r.view === "featured") p.set("view", r.view);
+  else if (r.view === "journey") p.set("journey", r.id);
+  else if (r.view === "saved" || r.view === "featured" || r.view === "diary") p.set("view", r.view);
   else if (r.view === "search") p.set("q", r.q);
   const s = p.toString();
   return s ? `?${s}` : window.location.pathname;
@@ -65,7 +68,7 @@ function bigThumb(item) {
 /* ------------------------------------------------------------------ header */
 
 /** One quiet line floating over the page in glass: the name, the search (plain text over a hairline), the saved count. */
-function Header({ route, savedCount, onSearch, onHome, onSaved }) {
+function Header({ route, savedCount, journeyCount, onSearch, onHome, onSaved, onDiary }) {
   const [text, setText] = useState(route.view === "search" ? route.q : "");
 
   useEffect(() => {
@@ -95,6 +98,13 @@ function Header({ route, savedCount, onSearch, onHome, onSaved }) {
             enterKeyHint="search"
           />
         </form>
+        <button
+          type="button"
+          onClick={onDiary}
+          className={`calm shrink-0 transition-colors ${route.view === "diary" || route.view === "journey" ? "text-ink" : "text-mute hover:text-ink"}`}
+        >
+          Diario{journeyCount > 0 && <span className="ml-1.5 text-mute">{journeyCount}</span>}
+        </button>
         <button type="button" onClick={onSaved} className={`calm shrink-0 transition-colors ${route.view === "saved" ? "text-ink" : "text-mute hover:text-ink"}`}>
           Salvati{savedCount > 0 && <span className="ml-1.5 text-mute">{savedCount}</span>}
         </button>
@@ -754,12 +764,15 @@ function Stimulus({ entry, first, active, dive, onFollow, onSave, sectionRef }) 
  * door (in the list or on the picture, or its number on the keyboard) dives into it.
  * There is no trail to keep: only what comes next.
  */
-function Flow({ route, preview, cardHandlers }) {
+function Flow({ route, preview, cardHandlers, onKept }) {
   const [stream, setStream] = useState(() => [
     { key: `s0-${route.file}`, title: route.file, item: preview?.title === route.file ? preview : null, via: null, data: null },
   ]);
   const [dive, setDive] = useState(null);
   const [active, setActive] = useState(0);
+  const started = useRef(Date.now() / 1000);
+  // Ending the journey: its recap replaces the stream, which stays as it was to go back to
+  const [ending, setEnding] = useState(null);
   const asked = useRef(new Map()); // entry key -> AbortController of its stream
   const sections = useRef(new Map());
   const count = useRef(1);
@@ -915,6 +928,79 @@ function Flow({ route, preview, cardHandlers }) {
     });
   }, []);
 
+  const journey = () => ({
+    started: started.current,
+    ended: Date.now() / 1000,
+    steps: stream
+      .filter((e) => e.item?.thumb)
+      .map((e) => ({
+        title: e.title,
+        item: e.item,
+        via: e.via && { title: e.via.title, leap: e.via.leap, anchor: e.via.anchor, hook: e.via.hook, url: e.via.url },
+        seeing: e.data?.seeing || "",
+        doors: e.data?.doors?.length || 0,
+      })),
+  });
+
+  const end = () => {
+    const j = journey();
+    withTransition(() => setEnding({ ...j, title: "", summary: "", stats: null, writing: true, keptId: null }));
+    window.scrollTo(0, 0);
+    api("/journey/recap", { body: j })
+      .then((r) => setEnding((e) => e && { ...e, ...r, writing: false }))
+      .catch(() => setEnding((e) => e && { ...e, writing: false }));
+  };
+
+  const keep = async () => {
+    try {
+      const { id } = await api("/journeys", { body: ending });
+      setEnding((e) => ({ ...e, keptId: id }));
+      onKept();
+    } catch {
+      window.dispatchEvent(new CustomEvent("toast", { detail: "Non sono riuscito a salvarlo" }));
+    }
+  };
+
+  const back = () => {
+    withTransition(() => setEnding(null));
+    requestAnimationFrame(() => document.getElementById(stream[Math.max(0, active)]?.key)?.scrollIntoView({ block: "start" }));
+  };
+
+  if (ending)
+    return (
+      <Recap
+        journey={ending}
+        writing={ending.writing}
+        onTitle={ending.keptId ? null : (title) => setEnding((e) => ({ ...e, title }))}
+        onOpenStep={(step) => cardHandlers.onOpen(step.item)}
+        actions={
+          ending.keptId ? (
+            <>
+              <span className="text-ink">Nel diario</span>
+              <button type="button" className="link" onClick={() => cardHandlers.onNav("diary")}>
+                Apri il diario
+              </button>
+              <button type="button" className="link" onClick={() => cardHandlers.onNav("feed")}>
+                Nuovo percorso
+              </button>
+            </>
+          ) : (
+            <>
+              <button type="button" className="link text-ink" disabled={ending.writing} onClick={keep}>
+                Salva nel diario
+              </button>
+              <button type="button" className="link" onClick={back}>
+                Torna al percorso
+              </button>
+              <button type="button" className="link" onClick={() => cardHandlers.onNav("feed")}>
+                Nuovo percorso
+              </button>
+            </>
+          )
+        }
+      />
+    );
+
   return (
     <main className="mx-auto max-w-[1500px] px-6 pb-12">
       {stream.map((e, i) => (
@@ -930,7 +1016,244 @@ function Flow({ route, preview, cardHandlers }) {
         />
       ))}
       <InfiniteSentinel onVisible={more} active={Boolean(last.data?.done && last.data.next >= 0)} margin="160px" />
+      <Trail
+        steps={stream.filter((e) => e.item?.thumb)}
+        onStep={(key) => document.getElementById(key)?.scrollIntoView({ behavior: reduceMotion() ? "auto" : "smooth", block: "start" })}
+        onEnd={end}
+      />
     </main>
+  );
+}
+
+/* ------------------------------------------------------------------ journeys */
+
+const TRAIL_SHOWN = 6; // the last pictures in the trail; the recap and the diary have them all
+const DAY = new Intl.DateTimeFormat("it-IT", { day: "numeric", month: "long", year: "numeric" });
+const MONTH = new Intl.DateTimeFormat("it-IT", { month: "long", year: "numeric" });
+const WEEKDAY = new Intl.DateTimeFormat("it-IT", { weekday: "short" });
+
+/** A step's picture keeps its name from the trail to the recap, so ending the journey flies it there. */
+const stepName = (i) => `step-${i}`;
+
+/**
+ * The journey so far, floating in glass at the foot of the flow: its last pictures (each scrolls back
+ * to its spread), how many steps, and the way to end it. It appears with the first door followed.
+ */
+function Trail({ steps, onStep, onEnd }) {
+  if (steps.length < 2) return null;
+  const from = Math.max(0, steps.length - TRAIL_SHOWN);
+  return (
+    <div className="trail glass fixed bottom-5 left-1/2 z-40 flex -translate-x-1/2 items-center gap-3 rounded-full py-1.5 pr-1.5 pl-2">
+      <span className="flex items-center gap-1">
+        {from > 0 && <span className="pr-1 text-mute tabular-nums">+{from}</span>}
+        {steps.slice(from).map((e, j) => (
+          <button
+            key={e.key}
+            type="button"
+            onClick={() => onStep(e.key)}
+            title={e.via?.title || prettyName(e.item?.name)}
+            className="trail-step block h-7 w-7 overflow-hidden rounded-[7px]"
+            style={{ viewTransitionName: stepName(from + j) }}
+          >
+            <img src={e.item.thumb} alt="" className="h-full w-full object-cover" />
+          </button>
+        ))}
+      </span>
+      <span className="text-mute tabular-nums">{steps.length} tappe</span>
+      <button type="button" onClick={onEnd} className="calm rounded-full bg-ink px-3.5 py-1 text-paper transition-opacity hover:opacity-85">
+        Concludi
+      </button>
+    </div>
+  );
+}
+
+function statsOf(stats) {
+  if (!stats) return [];
+  const far = (stats.leaps?.altrove || 0) + (stats.leaps?.scala || 0);
+  return [
+    [stats.pictures, stats.pictures === 1 ? "immagine" : "immagini"],
+    [stats.concepts, stats.concepts === 1 ? "concetto" : "concetti"],
+    far ? [far, far === 1 ? "salto lontano" : "salti lontani"] : null,
+    [stats.minutes, stats.minutes === 1 ? "minuto" : "minuti"],
+  ].filter(Boolean);
+}
+
+/**
+ * A journey told back: the day, a title (the curator's, which can be changed before keeping it),
+ * a few sentences on what ties the steps together, its numbers, then the trail itself as a
+ * collection, step by step along a thread: each picture with the door that led to it.
+ */
+function Recap({ journey, writing, onTitle, onOpenStep, actions }) {
+  const { steps, summary, stats, ended } = journey;
+  return (
+    <main className="mx-auto max-w-[720px] px-6 pt-12 pb-12">
+      <p className="fade-in text-mute">{DAY.format(new Date((ended || Date.now() / 1000) * 1000))}</p>
+      <div className="mt-2 min-h-[1.2em] text-[28px] leading-[1.2] tracking-[-0.015em]">
+        {writing ? (
+          <span className="breathe mt-3 block h-3 w-64 rounded-full bg-rule-2" />
+        ) : onTitle ? (
+          <input
+            value={journey.title}
+            onChange={(e) => onTitle(e.target.value)}
+            aria-label="Titolo del percorso"
+            className="fade-in w-full bg-transparent text-ink outline-none first-letter:uppercase"
+          />
+        ) : (
+          <h1 className="fade-in first-letter:uppercase">{journey.title}</h1>
+        )}
+      </div>
+      <div className="mt-3 min-h-[4.8em] max-w-[580px]">
+        {writing ? (
+          <Breathing>Il curatore ripercorre le tappe</Breathing>
+        ) : (
+          summary && <p className="fade-in text-ink-2">{summary}</p>
+        )}
+      </div>
+      <p className="mt-5 flex flex-wrap gap-x-5 gap-y-1 text-mute">
+        {statsOf(stats).map(([n, word]) => (
+          <span key={word} className="fade-in">
+            <span className="text-ink tabular-nums">{n}</span> {word}
+          </span>
+        ))}
+      </p>
+      <p className="mt-6 flex flex-wrap gap-x-5 gap-y-2 text-mute">{actions}</p>
+
+      <ol className="mt-14">
+        {steps.map((st, i) => (
+          <li key={`${i}-${st.title}`} className="rise group relative grid grid-cols-[72px_1fr] gap-5 pb-9" style={{ animationDelay: `${0.15 + i * 0.07}s` }}>
+            {/* The thread from one picture to the next */}
+            {i < steps.length - 1 && <span className="absolute top-[98px] bottom-2 left-[36px] w-px bg-rule-2" />}
+            <button
+              type="button"
+              onClick={() => onOpenStep(st)}
+              title="Riparti da qui"
+              className="placeholder block aspect-[4/5] w-[72px] overflow-hidden rounded-[6px]"
+              style={{ viewTransitionName: stepName(i) }}
+            >
+              <img src={st.item.thumb} alt="" className="h-full w-full object-cover" />
+            </button>
+            <div className="min-w-0 pt-0.5">
+              <p className="flex gap-2 text-mute">
+                <span className="tabular-nums">{i + 1}</span>
+                <span className="min-w-0 truncate">
+                  {st.via ? `${st.via.leap}${st.via.anchor ? ` · ${st.via.anchor}` : ""}` : "partenza"}
+                </span>
+              </p>
+              <p className="text-ink first-letter:uppercase">{st.via ? st.via.title : prettyName(st.item.name)}</p>
+              {st.via?.hook && <p className="text-ink-2">{st.via.hook}</p>}
+              <button
+                type="button"
+                onClick={() => onOpenStep(st)}
+                className="calm mt-1 text-mute transition-[opacity,color] hover:text-ink focus:opacity-100 lg:opacity-0 lg:group-hover:opacity-100"
+              >
+                Riparti da qui →
+              </button>
+            </div>
+          </li>
+        ))}
+      </ol>
+    </main>
+  );
+}
+
+/** The diary: the journeys kept, newest first, by month, each with its day, title and pictures. */
+function Diary({ onOpen }) {
+  const [items, setItems] = useState(null);
+  useEffect(() => {
+    api("/journeys")
+      .then((r) => setItems(r.items))
+      .catch(() => setItems([]));
+  }, []);
+  const months = [];
+  (items || []).forEach((j) => {
+    const m = MONTH.format(new Date(j.ended * 1000));
+    if (months[months.length - 1]?.m !== m) months.push({ m, list: [] });
+    months[months.length - 1].list.push(j);
+  });
+  return (
+    <main className="mx-auto max-w-[900px] px-6 pt-12 pb-12">
+      <p className="rise rise-1">Diario</p>
+      <p className="rise rise-2 mt-1 text-mute">I percorsi che hai concluso e tenuto.</p>
+      {items && !items.length && <p className="fade-in mt-12 text-mute">Nessun percorso ancora. Quando ne concludi uno, lo trovi qui.</p>}
+      {months.map(({ m, list }) => (
+        <section key={m} className="mt-12">
+          <h2 className="fade-in border-b border-rule pb-2.5 text-mute first-letter:uppercase">{m}</h2>
+          {list.map((j, i) => {
+            const d = new Date(j.ended * 1000);
+            return (
+              <button
+                key={j.id}
+                type="button"
+                onClick={() => onOpen(j.id)}
+                className="rise group grid w-full grid-cols-[44px_1fr] items-start gap-5 border-b border-rule py-5 text-left md:grid-cols-[44px_1fr_auto]"
+                style={{ animationDelay: `${i * 0.06}s` }}
+              >
+                <span className="flex flex-col items-center leading-none">
+                  <span className="text-[24px] text-ink tabular-nums">{d.getDate()}</span>
+                  <span className="mt-1 text-[13px] text-mute">{WEEKDAY.format(d)}</span>
+                </span>
+                <span className="calm min-w-0 transition-transform group-hover:translate-x-[3px]">
+                  <span className="block text-ink first-letter:uppercase">{j.title}</span>
+                  {j.summary && <span className="line-clamp-2 text-ink-2">{j.summary}</span>}
+                  <span className="mt-1 block text-mute">{statsOf(j.stats).map(([n, w]) => `${n} ${w}`).join(" · ")}</span>
+                </span>
+                <span className="col-start-2 flex gap-1 md:col-start-3">
+                  {j.thumbs.map((t, k) => (
+                    <img key={k} src={t} alt="" className="h-12 w-10 rounded-[4px] object-cover" />
+                  ))}
+                </span>
+              </button>
+            );
+          })}
+        </section>
+      ))}
+    </main>
+  );
+}
+
+/** A journey from the diary, as a collection to reopen: start again from any of its steps. */
+function JourneyPage({ id, cardHandlers, onForgot }) {
+  const [j, setJ] = useState(null);
+  const [error, setError] = useState("");
+  const [sure, setSure] = useState(false);
+  useEffect(() => {
+    api(`/journeys/${id}`)
+      .then(setJ)
+      .catch((e) => setError(e.message));
+  }, [id]);
+  if (error) return <p className="mx-auto max-w-[720px] px-6 pt-12 text-mute">{error}</p>;
+  if (!j) return <main className="mx-auto min-h-[60vh] max-w-[720px] px-6 pt-12" />;
+  const lastStep = j.steps[j.steps.length - 1];
+  return (
+    <Recap
+      journey={j}
+      writing={false}
+      onTitle={null}
+      onOpenStep={(st) => cardHandlers.onOpen(st.item)}
+      actions={
+        <>
+          <button type="button" className="link text-ink" onClick={() => cardHandlers.onOpen(lastStep.item)}>
+            Riprendi dall'ultima tappa
+          </button>
+          <button type="button" className="link" onClick={() => cardHandlers.onNav("diary")}>
+            Diario
+          </button>
+          <button
+            type="button"
+            className="link"
+            onClick={async () => {
+              if (!sure) return setSure(true);
+              await api(`/journeys/${id}`, { method: "DELETE" }).catch(() => {});
+              onForgot();
+              cardHandlers.onNav("diary");
+            }}
+            onBlur={() => setSure(false)}
+          >
+            {sure ? "Sicuro? Toglilo dal diario" : "Togli dal diario"}
+          </button>
+        </>
+      }
+    />
   );
 }
 
@@ -959,17 +1282,26 @@ export default function App() {
   const [route, setRoute] = useState(readRoute);
   const [preview, setPreview] = useState(null);
   const [savedCount, setSavedCount] = useState(0);
+  const [journeyCount, setJourneyCount] = useState(0);
   const [toast, setToast] = useState("");
   const lastToast = useRef("");
   if (toast) lastToast.current = toast; // keep the text while the toast fades out
 
   useEffect(() => {
     api("/health")
-      .then((h) => setSavedCount(h.saved))
+      .then((h) => {
+        setSavedCount(h.saved);
+        setJourneyCount(h.journeys || 0);
+      })
       .catch(() => setToast("Il server non risponde: è acceso?"));
     const onPop = () => setRoute(readRoute());
+    const onToast = (e) => setToast(e.detail);
     window.addEventListener("popstate", onPop);
-    return () => window.removeEventListener("popstate", onPop);
+    window.addEventListener("toast", onToast);
+    return () => {
+      window.removeEventListener("popstate", onPop);
+      window.removeEventListener("toast", onToast);
+    };
   }, []);
 
   useEffect(() => {
@@ -1020,12 +1352,27 @@ export default function App() {
       <Header
         route={route}
         savedCount={savedCount}
+        journeyCount={journeyCount}
         onSearch={(q) => go({ view: "search", q })}
         onHome={() => go({ view: "feed", q: "" })}
         onSaved={() => go({ view: "saved", q: "" })}
+        onDiary={() => go({ view: "diary", q: "" })}
       />
       {route.view === "flow" ? (
-        <Flow key={route.file} route={route} preview={preview?.title === route.file ? preview : null} cardHandlers={cardHandlers} />
+        <Flow
+          key={route.file}
+          route={route}
+          preview={preview?.title === route.file ? preview : null}
+          cardHandlers={cardHandlers}
+          onKept={() => {
+            setJourneyCount((c) => c + 1);
+            setToast("Nel diario");
+          }}
+        />
+      ) : route.view === "diary" ? (
+        <Diary onOpen={(id) => go({ view: "journey", id, q: "" })} />
+      ) : route.view === "journey" ? (
+        <JourneyPage key={route.id} id={route.id} cardHandlers={cardHandlers} onForgot={() => setJourneyCount((c) => Math.max(0, c - 1))} />
       ) : (
         <Browse key={`${route.view}:${route.q}`} route={route} cardHandlers={cardHandlers} />
       )}
@@ -1033,7 +1380,7 @@ export default function App() {
       <Footer />
 
       <div
-        className={`pointer-events-none glass fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full px-4 py-2 text-ink-2 transition-[opacity,filter] duration-[1400ms] ease-[cubic-bezier(.16,1,.3,1)] ${
+        className={`pointer-events-none glass fixed ${route.view === "flow" ? "bottom-[76px]" : "bottom-6"} left-1/2 z-50 -translate-x-1/2 rounded-full px-4 py-2 text-ink-2 transition-[opacity,filter] duration-[1400ms] ease-[cubic-bezier(.16,1,.3,1)] ${
           toast ? "opacity-100 blur-0" : "opacity-0 blur-[3px]"
         }`}
         role="status"

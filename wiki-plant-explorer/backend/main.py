@@ -40,6 +40,7 @@ from .embedder import SEMANTIC_DIM, VISUAL_DIM, Embedder
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "qdrant_db"
 FEEDBACK_PATH = ROOT / "state" / "feedback.json"
+JOURNEYS_PATH = ROOT / "state" / "journeys.json"  # the diary: journeys ended and kept
 CRAWL_PATH = ROOT / "state" / "crawler.json"
 ENV_PATH = ROOT / ".env"  # API keys (git-ignored); see .env.example
 COLLECTION = "commons_vectors"
@@ -215,6 +216,7 @@ async def lifespan(_: FastAPI):
     S["qdrant"] = client
     S["embed_lock"] = asyncio.Lock()
     S["feedback"] = load_feedback()
+    S["journeys"] = load_journeys()
     S["user_active"] = 0.0
     S["crawl"] = load_crawl_state()
     crawler_task = asyncio.create_task(crawler()) if CRAWL else None
@@ -266,6 +268,15 @@ def load_feedback() -> dict:
 def save_feedback() -> None:
     FEEDBACK_PATH.parent.mkdir(exist_ok=True)
     FEEDBACK_PATH.write_text(json.dumps(S["feedback"], ensure_ascii=False, indent=1))
+
+
+def load_journeys() -> list[dict]:
+    return json.loads(JOURNEYS_PATH.read_text()) if JOURNEYS_PATH.exists() else []
+
+
+def save_journeys() -> None:
+    JOURNEYS_PATH.parent.mkdir(exist_ok=True)
+    JOURNEYS_PATH.write_text(json.dumps(S["journeys"], ensure_ascii=False, indent=1))
 
 
 def votes(origin: Optional[str] = None) -> dict[str, int]:
@@ -490,7 +501,8 @@ async def crawler() -> None:
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "indexed": S["qdrant"].count(COLLECTION).count, "saved": len(saved_items()), "crawling": CRAWL}
+    return {"status": "ok", "indexed": S["qdrant"].count(COLLECTION).count, "saved": len(saved_items()),
+            "journeys": len(S["journeys"]), "crawling": CRAWL}
 
 
 def with_saved_flag(items: list[dict]) -> list[dict]:
@@ -1653,4 +1665,146 @@ async def vote(v: Vote):
     if v.value == 1 and item:  # make sure liked images have vectors so they can shape the ranking
         await ensure_vectors([item], new_budget=1)
         asyncio.create_task(note_interest(v.title, item))
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- journeys (the diary)
+#
+# A journey is the flow of one session: the pictures in the order they were met, each with the door
+# (concept) that led to it. Ending it writes a recap (a title and a few sentences on what ties the
+# steps together); keeping it puts it in the diary, where it can be reopened as a collection.
+
+LEAP_NAMES = {"dentro": "dentro", "perché": "perché", "altrove": "altrove", "scala": "di scala", "storia": "storia"}
+
+
+class JourneyStep(BaseModel):
+    title: str
+    item: dict
+    via: Optional[dict] = None  # the door that led here: title, leap, anchor, hook, url
+    seeing: str = ""  # what the curator saw in the picture
+    doors: int = 0  # how many doors it offered
+
+
+class JourneyIn(BaseModel):
+    steps: list[JourneyStep]
+    started: float
+    ended: Optional[float] = None
+    title: str = ""  # kept as the recap wrote it, or as the person changed it
+    summary: str = ""
+
+
+def journey_stats(j: JourneyIn) -> dict:
+    leaps: dict = {}
+    for s in j.steps:
+        if s.via and s.via.get("leap"):
+            leaps[s.via["leap"]] = leaps.get(s.via["leap"], 0) + 1
+    ended = j.ended or time.time()
+    return {
+        "pictures": len(j.steps),
+        "concepts": sum(1 for s in j.steps if s.via),
+        "doors_seen": sum(s.doors for s in j.steps),
+        "leaps": leaps,
+        "minutes": max(1, round((ended - j.started) / 60)),
+    }
+
+
+def recap_prompt(j: JourneyIn) -> str:
+    lines = []
+    for n, s in enumerate(j.steps, 1):
+        name = (s.item.get("name") or s.title.removeprefix("File:")).rsplit(".", 1)[0]
+        seen = f" (mostrava: {s.seeing})" if s.seeing else ""
+        if s.via:
+            via = s.via
+            lines.append(f'{n}. Dal dettaglio "{via.get("anchor") or "?"}" ({via.get("leap") or "?"}) al concetto '
+                         f'"{via.get("title")}": {via.get("hook") or ""} Foto: "{name}"{seen}')
+        else:
+            lines.append(f'{n}. Partenza, la foto "{name}"{seen}')
+    return (
+        "Hai accompagnato una persona in un percorso tra immagini e concetti di Wikipedia: da un dettaglio di "
+        "ogni foto si apre una porta verso un concetto, e la foto di quel concetto diventa la tappa successiva. "
+        "Le tappe, in ordine:\n" + "\n".join(lines) + "\n\n"
+        "Scrivi in italiano:\n"
+        "- sulla prima riga un titolo per il percorso: al massimo 6 parole, preciso e un po' sorprendente, senza "
+        "virgolette, due punti o punto finale;\n"
+        "- poi una riga vuota;\n"
+        "- poi 2 o 3 frasi in seconda persona che raccontano il filo che lega le tappe: da dove sei partito, il "
+        "salto più inatteso, che cosa hanno in comune cose così lontane. Tono asciutto e curioso, come un buon "
+        "curatore di museo. Niente elenchi, niente punti esclamativi, niente aggettivi come affascinante o "
+        "straordinario, niente frasi sul viaggio o sull'esplorazione in sé."
+    )
+
+
+def plain_title(j: JourneyIn) -> str:
+    """A title without the curator: from the first picture to the last concept."""
+    first = (j.steps[0].item.get("name") or j.steps[0].title.removeprefix("File:")).rsplit(".", 1)[0]
+    last = next((s.via["title"] for s in reversed(j.steps) if s.via), "")
+    return f"Da {first} a {last}" if last else first
+
+
+@app.post("/api/journey/recap")
+async def journey_recap(j: JourneyIn):
+    """The recap of a journey being ended: a title and a few sentences, plus its numbers."""
+    if not j.steps:
+        raise HTTPException(422, "Un percorso senza tappe")
+    title, summary = plain_title(j), ""
+    curator = S.get("curator")
+    if curator and len(j.steps) > 1:
+        t0 = time.time()
+        text = await curator.say(recap_prompt(j))
+        if text:
+            head, _, body = text.strip().partition("\n")
+            head = re.sub(r'^[#*\s"«]+|[*\s"».:]+$', "", head)
+            if head and len(head) <= 80:
+                title, summary = head, body.strip()
+            else:
+                summary = text.strip()
+            summary = re.sub(r"\*+", "", summary)
+        log.info("journey recap: %d steps in %.1fs%s", len(j.steps), time.time() - t0, "" if text else " (no text)")
+    return {"title": title, "summary": summary, "stats": journey_stats(j)}
+
+
+@app.post("/api/journeys")
+async def journey_keep(j: JourneyIn):
+    """Puts an ended journey in the diary."""
+    if not j.steps:
+        raise HTTPException(422, "Un percorso senza tappe")
+    entry = {
+        "id": uuid.uuid4().hex[:10],
+        "title": j.title.strip() or plain_title(j),
+        "summary": j.summary.strip(),
+        "started": j.started,
+        "ended": j.ended or time.time(),
+        "steps": [{**s.dict(), "item": clean(s.item)} for s in j.steps],
+        "stats": journey_stats(j),
+    }
+    S["journeys"].append(entry)
+    save_journeys()
+    return {"id": entry["id"]}
+
+
+@app.get("/api/journeys")
+async def journeys():
+    """The diary, newest first: each journey with its first pictures, not its whole trail."""
+    out = []
+    for e in sorted(S["journeys"], key=lambda e: -e["ended"]):
+        out.append({k: e[k] for k in ("id", "title", "summary", "started", "ended", "stats")}
+                   | {"thumbs": [s["item"].get("thumb") for s in e["steps"][:6]]})
+    return {"items": out}
+
+
+@app.get("/api/journeys/{jid}")
+async def journey(jid: str):
+    entry = next((e for e in S["journeys"] if e["id"] == jid), None)
+    if not entry:
+        raise HTTPException(404, "Percorso non trovato")
+    return {**entry, "steps": [{**s, "item": with_saved_flag([s["item"]])[0]} for s in entry["steps"]]}
+
+
+@app.delete("/api/journeys/{jid}")
+async def journey_forget(jid: str):
+    before = len(S["journeys"])
+    S["journeys"] = [e for e in S["journeys"] if e["id"] != jid]
+    if len(S["journeys"]) == before:
+        raise HTTPException(404, "Percorso non trovato")
+    save_journeys()
     return {"ok": True}

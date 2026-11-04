@@ -243,6 +243,21 @@ a:hover,
   from { opacity: 0; transform: translateY(var(--from, 4px)) scale(0.97); filter: blur(2px); }
 }
 
+/* The trail at the foot of the flow: it rises in with the first door followed, and each new step
+   grows in on the same soft spring as the lifted detail */
+.trail {
+  animation: trail-in 0.7s var(--ease-settle) both;
+}
+@keyframes trail-in {
+  from { opacity: 0; transform: translateY(14px) scale(0.96); filter: blur(4px); }
+}
+.trail-step {
+  animation: step-in 0.55s var(--ease-settle) both;
+}
+@keyframes step-in {
+  from { opacity: 0; transform: scale(0.5); }
+}
+
 /* Diving into a door: its little picture grows into the next spread */
 ::view-transition-group(dive) {
   animation-duration: 1.2s;
@@ -332,7 +347,7 @@ input::placeholder {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .rise, .fade-in, .breathe, .open-in, .lift.is-on .lift-tag { animation: none; }
+  .rise, .fade-in, .breathe, .open-in, .lift.is-on .lift-tag, .trail, .trail-step { animation: none; }
   .lift, .lift-detail, .lift-tag { transition: opacity 0.3s; }
   .lift.is-on .lift-detail { transform: none; }
   .fold, .fold > div > *, .recede > *, .plus::after, a, .link { transition: none; }

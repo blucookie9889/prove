@@ -182,6 +182,20 @@ No line across the page. Clicking dives in: the row's thumbnail grows into the n
 `dive`). Keys: 1-9 open that door of the spread in view, → the one scrolling would take. The next
 spread is added when the end is within 160 px, so pictures are not worked out in a cascade.
 
+## Journeys and the diary (`/api/journey/recap`, `/api/journeys`)
+
+A journey is the flow of one session: its pictures in order, each with the door that led to it.
+From the first door followed, a glass trail floats at the foot of the flow (its last 6 pictures,
+the number of steps, "Concludi"). Ending it swaps the stream for the recap, which the stream stays
+behind to go back to: the trail's pictures fly to their place in the recap (shared View Transition
+names `step-<i>`). `POST /api/journey/recap` asks the curator for a title (first line, at most six
+words) and two or three sentences on what ties the steps together (`Engine.say`: text only; Gemini
+with the same model chain, else the local model), with numbers (pictures, concepts, far leaps =
+altrove + scala, minutes). Without a curator the title is "Da <first picture> a <last concept>".
+"Salva nel diario" keeps it (`POST /api/journeys`, in `state/journeys.json`, git-ignored); the title
+can be changed before. `?view=diary`: journeys by month, newest first; `?journey=<id>`: the recap
+of one, a collection to start again from any step, or to take out of the diary.
+
 ## Concepts: what a detail is (`/api/concepts`, `/api/concept`)
 
 `/api/concepts?title=` names each link of a page (same order as its links), from free Wikimedia data
