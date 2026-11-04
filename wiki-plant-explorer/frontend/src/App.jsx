@@ -64,7 +64,7 @@ function bigThumb(item) {
 
 /* ------------------------------------------------------------------ header */
 
-/** One quiet line: the name, the search (plain text over a hairline), the saved count. */
+/** One quiet line floating over the page in glass: the name, the search (plain text over a hairline), the saved count. */
 function Header({ route, savedCount, onSearch, onHome, onSaved }) {
   const [text, setText] = useState(route.view === "search" ? route.q : "");
 
@@ -74,8 +74,8 @@ function Header({ route, savedCount, onSearch, onHome, onSaved }) {
   }, [route]);
 
   return (
-    <header className="sticky top-0 z-30 bg-paper/90 backdrop-blur-md">
-      <div className="mx-auto flex h-16 max-w-[1500px] items-center gap-6 px-6">
+    <header className="sticky top-0 z-30 px-3 pt-3">
+      <div className="glass relative mx-auto flex h-13 max-w-[1500px] items-center gap-6 rounded-[18px] px-5">
         <button type="button" onClick={onHome} className="shrink-0 text-ink">
           Wiki Explorer
         </button>
@@ -91,7 +91,7 @@ function Header({ route, savedCount, onSearch, onHome, onSaved }) {
             onChange={(e) => setText(e.target.value)}
             placeholder="Cerca"
             aria-label="Cerca tra le immagini libere"
-            className="calm w-full border-b border-rule-2 bg-transparent py-1.5 text-ink transition-colors outline-none focus:border-ink"
+            className="calm w-full border-b border-ink/10 bg-transparent py-1.5 text-ink transition-colors outline-none placeholder:text-mute focus:border-ink/60"
             enterKeyHint="search"
           />
         </form>
@@ -445,7 +445,7 @@ function Lift({ door, n, src }) {
         <img src={src} alt="" />
       </span>
       {/* A new tag per door: it appears where its detail lands, instead of sliding across the picture */}
-      <span key={k} className={`lift-tag ${below ? "is-below" : "is-above"} ${right ? "is-right" : ""}`}>
+      <span key={k} className={`lift-tag glass ${below ? "is-below" : "is-above"} ${right ? "is-right" : ""}`}>
         <span className="text-mute tabular-nums">{k + 1}</span>
         <span className="min-w-0 truncate first-letter:uppercase">{d.title}</span>
       </span>
@@ -609,7 +609,7 @@ function DoorRow({ door, n, isNext, hover, onHover, onFollow, thumbRef }) {
           )}
         </span>
         <span className={`block transition-colors duration-[1200ms] first-letter:uppercase ${door.ready ? "text-ink" : "text-mute"}`}>{door.title}</span>
-        <span className="line-clamp-2 text-ink-2">{door.hook}</span>
+        <span className="block text-ink-2">{door.hook}</span>
       </span>
     </button>
     </div>
@@ -1033,7 +1033,7 @@ export default function App() {
       <Footer />
 
       <div
-        className={`pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 border border-rule bg-paper px-4 py-2 text-ink-2 transition-[opacity,filter] duration-[1400ms] ease-[cubic-bezier(.16,1,.3,1)] ${
+        className={`pointer-events-none glass fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full px-4 py-2 text-ink-2 transition-[opacity,filter] duration-[1400ms] ease-[cubic-bezier(.16,1,.3,1)] ${
           toast ? "opacity-100 blur-0" : "opacity-0 blur-[3px]"
         }`}
         role="status"

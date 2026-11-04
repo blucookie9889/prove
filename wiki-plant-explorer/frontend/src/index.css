@@ -4,7 +4,7 @@
 @theme {
   --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "Geist Mono", ui-monospace, "SF Mono", monospace;
-  --color-paper: #faf9f6;
+  --color-paper: #fdfdfc;
   --color-ink: #1d1c1a;
   --color-ink-2: #55534d;
   --color-mute: #a19e97;
@@ -136,6 +136,35 @@ a:hover,
   50% { opacity: 0.2; }
 }
 
+/* Liquid glass, for what floats over the content (the header, the tag on a picture, the toast):
+   what lies under it shows through blurred and a little more saturated, a faint white body keeps
+   text legible over any picture, and a hairline rim catches the light at the top left and, more
+   faintly, at the bottom right, as an edge of glass does. No tint, no colour of its own. */
+.glass {
+  isolation: isolate; /* positioned by whoever uses it: the rim needs a positioned parent */
+  background: linear-gradient(180deg, rgb(255 255 255 / 0.72), rgb(255 255 255 / 0.56));
+  -webkit-backdrop-filter: blur(16px) saturate(1.7) brightness(1.04);
+  backdrop-filter: blur(16px) saturate(1.7) brightness(1.04);
+  box-shadow:
+    inset 0 0.5px 0 rgb(255 255 255 / 0.95),
+    0 0 0 0.5px rgb(29 28 26 / 0.07),
+    0 1px 2px rgb(29 28 26 / 0.05),
+    0 10px 30px -14px rgb(29 28 26 / 0.28);
+}
+.glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  padding: 1px;
+  border-radius: inherit;
+  background: linear-gradient(135deg, rgb(255 255 255 / 0.95), rgb(255 255 255 / 0.15) 32%, rgb(255 255 255 / 0) 55%, rgb(255 255 255 / 0.45));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  pointer-events: none;
+}
+
 /* A detail lifted off its picture. The box is registered so the lift glides between details; the
    crop inside it, the tag and the lift are all placed from the same four numbers, so they move as one. */
 @property --x0 { syntax: "<number>"; inherits: true; initial-value: 0; }
@@ -195,13 +224,11 @@ a:hover,
   gap: 7px;
   max-width: 68%;
   padding: 3px 9px;
-  border-radius: 5px;
-  background: var(--color-paper);
+  border-radius: 8px;
   color: var(--color-ink);
   font-size: 13px;
   line-height: 1.45;
   white-space: nowrap;
-  box-shadow: 0 0.5px 1px rgb(29 28 26 / 0.2), 0 8px 20px -8px rgb(29 28 26 / 0.45);
   opacity: 0;
   transition: opacity 0.25s var(--ease-calm);
 }
