@@ -122,7 +122,7 @@ PAGES_CACHED = 32
 # door is checked against the picture, grounded in its Wikipedia article and shown with the best
 # picture of it that the person has not seen yet.
 LOCAL_MODEL = "gemma4:26b-a4b"  # Ollama model of the local curator (OLLAMA_MODEL in .env overrides it)
-GEMINI_MODELS = "gemini-3.8-flash,gemini-3.5-flash-lite"  # best first; the next when one is busy
+GEMINI_MODELS = "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash,gemma-4-26b-a4b-it"  # best first; the next when one is busy
 FLOW_CACHED = 64
 # A door must point at something: its box is not the whole picture, not the same detail as a door
 # already open, and the crop (grown by DOOR_PAD) is not clearly less like the named detail than the

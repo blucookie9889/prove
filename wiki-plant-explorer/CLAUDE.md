@@ -144,7 +144,7 @@ picture being worked out is followed, never asked for twice; finished ones are c
    - `GeminiCurator` (`CURATOR=gemini`): Interactions API, `stream: true`, `store: false`; free only
      on a project without billing (2026-11: the key's project was prepaid and every picture cost; on
      402 it stops asking for 15 min). `GEMINI_MODEL` lists models best first (default
-     gemini-3.8-flash, then gemini-3.5-flash-lite): on 503 (free calls are the first turned away when
+     gemini-3.8-flash, 3.6-flash, 3.5-flash, then Gemma 4 hosted by Google): on 503 (free calls are the first turned away when
      demand spikes) or 429 the next one answers, and a model out of quota is skipped for 15 min.
      `thinking_level` low while the person waits, `GEMINI_THINKING` for the picture prepared ahead.
    - `Curator` (`CURATOR=claude`): Claude Opus 5.5 (effort medium, `fallbacks: "default"`), whole.

@@ -11,8 +11,9 @@ Three engines, same prompt and schema (``CURATOR`` in .env picks one; default ``
     ``OLLAMA_URL``). Free, and nothing leaves the computer. The default and the only one used unless
     another is chosen explicitly.
   - ``GeminiCurator`` (``CURATOR=gemini``): Google Gemini with an AI Studio key (``GEMINI_API_KEY``);
-    ``GEMINI_MODEL`` lists models best first (default ``gemini-3.8-flash,gemini-3.5-flash-lite``), and
-    when one is overloaded or out of quota the next answers. Free only on a project without billing: on
+    ``GEMINI_MODEL`` lists models best first (default
+    ``gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash,gemma-4-26b-a4b-it``), and when one is
+    overloaded or out of quota the next answers. Free only on a project without billing: on
     a paid or prepaid project every picture costs. Sent with ``store: false``. It stops asking for a
     while after "payment required", and skips a model for a while after "quota exhausted".
   - ``Curator`` (``CURATOR=claude``): Claude through the Anthropic API (paid, needs ANTHROPIC_API_KEY).
@@ -576,10 +577,15 @@ class GeminiCurator(Engine):
                 return text
         return None
 
+    @staticmethod
+    def thinking_for(model: str, level: str) -> dict:
+        """Gemma hosted by Google takes no thinking level (HTTP 400): it thinks as it likes."""
+        return {} if model.startswith("gemma") else {"thinking_level": level}
+
     async def say_once(self, model: str, prompt: str) -> Optional[str]:
         """One model's text answer; None (and the model rested) when it is overloaded."""
         body = {"model": model, "store": False, "stream": True, "input": [{"type": "text", "text": prompt}],
-                "generation_config": {"thinking_level": "low"}}
+                "generation_config": self.thinking_for(model, "low")}
         text = ""
         async with self.http.stream("POST", self.URL, json=body) as resp:
             if resp.status_code != 200:
@@ -614,7 +620,7 @@ class GeminiCurator(Engine):
                 {"type": "text", "text": context_text(name, via, seen)},
             ],
             "response_format": {"type": "text", "mime_type": "application/json", "schema": SCHEMA},
-            "generation_config": {"thinking_level": self.thinking if deep else "low"},  # low while someone waits
+            "generation_config": self.thinking_for(model, self.thinking if deep else "low"),  # low while someone waits
         }
         answer = AnswerStream()
         usage: dict = {}
