@@ -31,6 +31,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from qdrant_client import QdrantClient, models
 
+from .arena import Taste
 from .commons import Commons
 from .curator import Curator, Fallback, GeminiCurator, LocalCurator
 from .sources import Cleveland, INaturalist, Pexels, RateLimited, Unsplash
@@ -55,6 +56,11 @@ MORE = 0.7
 LESS = 0.35
 # Pull towards everything ever liked, so the ranking slowly learns the user's visual taste.
 TASTE = 0.12
+# Pull towards what the people in ARENA_TASTE collect on Are.na (0..1 within the candidates): a weight,
+# never a filter, so the journey still surprises. Door pictures compete within FLOW_SPREAD of
+# relevance; "Per te" is reordered by it within each page.
+ARENA_PICTURES = 0.04
+ARENA_HOME = 0.5  # share of a page's order that comes from the taste (the rest: the interests)
 MAX_CANDIDATES = 400
 # DINOv2 cosine above which two images are treated as the same picture (crop, re-upload, burst).
 NEAR_DUP = 0.94
@@ -220,9 +226,17 @@ async def lifespan(_: FastAPI):
     S["user_active"] = 0.0
     S["crawl"] = load_crawl_state()
     crawler_task = asyncio.create_task(crawler()) if CRAWL else None
+    people = [p.strip() for p in env.get("ARENA_TASTE", "").split(",") if p.strip()]
+    S["taste"] = Taste(ROOT / "state", env.get("ARENA_TOKEN"), people)
+    log.info("taste: %s", S["taste"].describe() if people else "off (no ARENA_TASTE)")
+    taste_task = (asyncio.create_task(S["taste"].refresh(S["embedder"], S["embed_lock"]))
+                  if people and S["taste"].stale() else None)
     yield
     if crawler_task:
         crawler_task.cancel()
+    if taste_task:
+        taste_task.cancel()
+    await S["taste"].close()
     await S["commons"].close()
     client.close()
 
@@ -240,7 +254,7 @@ def load_env() -> dict:
                 env[key.strip()] = value.strip().strip("'\"")
     env.update({k: v for k, v in os.environ.items()
                 if k in ("UNSPLASH_ACCESS_KEY", "PEXELS_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GEMINI_MODEL",
-                         "GEMINI_THINKING", "OLLAMA_URL", "OLLAMA_MODEL", "CURATOR")})
+                         "GEMINI_THINKING", "OLLAMA_URL", "OLLAMA_MODEL", "CURATOR", "ARENA_TOKEN", "ARENA_TASTE")})
     return env
 
 
@@ -502,7 +516,7 @@ async def crawler() -> None:
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "indexed": S["qdrant"].count(COLLECTION).count, "saved": len(saved_items()),
-            "journeys": len(S["journeys"]), "crawling": CRAWL}
+            "journeys": len(S["journeys"]), "crawling": CRAWL, "taste": S["taste"].describe()}
 
 
 def with_saved_flag(items: list[dict]) -> list[dict]:
@@ -1195,6 +1209,8 @@ async def door_pictures(queries: list[str], taken: set, lead: Optional[str] = No
         rel = sem @ text_vector(queries[0])
         quality = aesthetic(sem)
         score = rel + AESTH_SEARCH * beauty(quality) + np.asarray([FLOW_CURATED if c["title"] in curated else 0.0 for c in known])
+        if S["taste"]:
+            score = score + ARENA_PICTURES * minmax(S["taste"].score(vis, sem))
         # Usable: good enough to look at and not like a picture already shown. Then relevant: close to
         # the best usable one (a diagram that matches better must not shut out a fine photograph), and
         # never below the floor (a stained-glass roundel for Murray's law scored 0.15). The article's own
@@ -1610,6 +1626,18 @@ def build_for_you(seeds: list[str]) -> list[dict]:
             continue
         kept.append(it)
         kept_v.append(v)
+    if S["taste"] and kept:
+        # Within each page, what the people in ARENA_TASTE would keep moves up; the interests still
+        # decide which pictures are on the page, and roughly where.
+        sems = {p.payload["title"]: np.asarray(p.vector["semantic"], dtype=np.float32) for p in out}
+        near = S["taste"].score(np.stack(kept_v), np.stack([sems[it["title"]] for it in kept]))
+        pages = []
+        for start in range(0, len(kept), FOR_YOU_PAGE):
+            idx = np.arange(start, min(start + FOR_YOU_PAGE, len(kept)))
+            place = 1 - (idx - start) / max(len(idx) - 1, 1)
+            key = (1 - ARENA_HOME) * place + ARENA_HOME * minmax(near[idx])
+            pages += [kept[i] for i in idx[np.argsort(-key, kind="stable")]]
+        kept = pages
     return kept
 
 

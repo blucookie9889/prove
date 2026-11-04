@@ -21,6 +21,7 @@ backend/commons.py   async client for Commons/Wikidata APIs (search, feed, categ
 backend/sources.py   other collections (Cleveland, iNaturalist, Unsplash, Pexels): search, get by id, items in
                      the Commons shape; `Budget` caps requests per hour for the keyed APIs
 backend/translator.py  local MarianMT Italian -> English
+backend/arena.py     taste from Are.na: public images of the ARENA_TASTE profiles as vector clouds
 .env                 UNSPLASH_ACCESS_KEY / PEXELS_API_KEY / CURATOR / OLLAMA_MODEL / GEMINI_API_KEY /
                      ANTHROPIC_API_KEY (git-ignored; template in .env.example)
 backend/curator.py   the curator: LocalCurator (Ollama, gemma4:26b-a4b, free, default), GeminiCurator
@@ -85,6 +86,21 @@ flat snapshots and product shots (`PLAIN`), above ~0.02 = good photos.
   query text within 0.71 cosine of a negative prompt, e.g. "ancient map", "manuscript").
 - Similar: + 0.15·beauty and `JUNK` hidden, unless the origin itself is below `PLAIN`.
 - Per te: images below `PLAIN` are dropped.
+
+## Taste from Are.na (`ARENA_TASTE`, `ARENA_TOKEN`)
+
+`ARENA_TASTE` lists Are.na profile slugs of people with an eye (2026-11: david-wissel, jul-gross,
+dima-savva, charlie-humble-thomas, mike-rito). At startup, when a cloud is over a day old,
+`Taste.refresh` reads each person's newest public Image blocks (at most 300, pages of 100 with a
+pause, named User-Agent: Are.na forbids harvesting), embeds the small thumbs and keeps only the
+vectors in `state/taste.npz` (block ids in `state/taste.json`, so a refresh fetches only what is
+new). The clouds stay apart: `Taste.score` is, per person, the mean similarity (0.5 DINOv2 + 0.5
+CLIP) to their 5 nearest images, averaged over people (fewer than 40 images count less), so
+different eyes don't blur into one average. A weight, never a filter:
+- Door pictures: + `ARENA_PICTURES` (0.04)·minmax(taste), among those within `FLOW_SPREAD` of relevance.
+- Per te: each page of 40 is reordered by 0.5·place + 0.5·minmax(taste); interests still pick the page.
+Checked on Commons searches: chairs, lamps, diagrams and maps come nearest; landscapes, garden
+flowers and sports photos farthest.
 
 ## Image page (`/api/page`): parts of an image as links
 
