@@ -534,39 +534,56 @@ class GeminiCurator(Engine):
         self.off_until = 0.0  # after "payment required": stop asking for a while
         self.rested: dict[str, float] = {}  # model -> until when it is overloaded or out of quota
 
+    def in_turn(self) -> list[str]:
+        """Who to ask, in order: the rested models are not skipped but asked last, those whose rest
+        ends first before the others, so that when all of them are busy at once someone is still asked."""
+        now = time.time()
+        fresh = [m for m in self.models if now >= self.rested.get(m, 0)]
+        tired = sorted((m for m in self.models if now < self.rested.get(m, 0)), key=lambda m: self.rested[m])
+        return fresh + tired
+
     async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
                      deep: bool = True) -> AsyncIterator[tuple[str, object]]:
-        for model in self.models:
-            if time.time() < self.off_until:
+        order = self.in_turn()
+        for pause in (2, 5, None):  # a busy moment often passes in seconds: the busy ones are asked again
+            again = []
+            for i, model in enumerate(order):
+                if time.time() < self.off_until:
+                    return
+                answer = self.ask(model, image, name, via, seen, deep)
+                # Only rested models left to ask after it: it gets the long wait
+                last = all(time.time() < self.rested.get(m, 0) for m in order[i + 1:])
+                try:
+                    first = await asyncio.wait_for(answer.__anext__(),
+                                                   self.FIRST_WORD_AHEAD if deep or last else self.FIRST_WORD)
+                except StopAsyncIteration:
+                    return  # answered nothing for another reason (logged): the local model's turn
+                except asyncio.TimeoutError:
+                    log.warning("gemini curator: %s said nothing in time for %s, asking the next", model, name)
+                    self.rested[model] = time.time() + self.BUSY_REST
+                    await answer.aclose()
+                    continue
+                if first == ("busy", None):
+                    if self.rested.get(model, 0) <= time.time() + 70:
+                        again.append(model)  # busy, not over its calls for the minute
+                    self.rested[model] = max(self.rested.get(model, 0), time.time() + self.BUSY_REST)
+                    await answer.aclose()
+                    continue
+                yield first
+                async for event in answer:
+                    if event != ("busy", None):
+                        yield event
                 return
-            if time.time() < self.rested.get(model, 0):
-                continue
-            answer = self.ask(model, image, name, via, seen, deep)
-            try:
-                first = await asyncio.wait_for(answer.__anext__(), self.FIRST_WORD_AHEAD if deep else self.FIRST_WORD)
-            except StopAsyncIteration:
-                return  # answered nothing for another reason (logged): the local model's turn
-            except asyncio.TimeoutError:
-                log.warning("gemini curator: %s said nothing in time for %s, asking the next", model, name)
-                self.rested[model] = time.time() + self.BUSY_REST
-                await answer.aclose()
-                continue
-            if first == ("busy", None):
-                self.rested[model] = max(self.rested.get(model, 0), time.time() + self.BUSY_REST)
-                await answer.aclose()
-                continue
-            yield first
-            async for event in answer:
-                if event != ("busy", None):
-                    yield event
-            return
+            if not again or pause is None:
+                return
+            log.info("gemini curator: every model busy for %s, asking %s again", name, ", ".join(again))
+            await asyncio.sleep(pause)
+            order = again
 
     async def say(self, prompt: str) -> Optional[str]:
-        for model in self.models:
+        for model in self.in_turn():
             if time.time() < self.off_until:
                 return None
-            if time.time() < self.rested.get(model, 0):
-                continue
             try:
                 text = await asyncio.wait_for(self.say_once(model, prompt), 30)
             except (httpx.HTTPError, asyncio.TimeoutError) as exc:
@@ -633,7 +650,7 @@ class GeminiCurator(Engine):
                     if resp.status_code == 402:
                         self.off_until = time.time() + 15 * 60
                     elif resp.status_code == 429:
-                        self.rested[model] = time.time() + 15 * 60  # out of quota: longer than busy
+                        self.rested[model] = time.time() + 65  # free calls are limited per minute
                     if resp.status_code in (429, 500, 503, 504):
                         yield ("busy", None)
                     return
