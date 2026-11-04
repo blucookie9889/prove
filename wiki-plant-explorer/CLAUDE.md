@@ -161,7 +161,8 @@ picture being worked out is followed, never asked for twice; finished ones are c
      on a project without billing (2026-11: the key's project was prepaid and every picture cost; on
      402 it stops asking for 15 min). `GEMINI_MODEL` lists models best first (default
      gemini-3.8-flash, 3.6-flash, 3.5-flash, then Gemma 4 hosted by Google): on 503 (free calls are the first turned away when
-     demand spikes) or 429 the next one answers; a model over its calls for the minute rests 65 s. Busy
+     demand spikes) or 429 the next one answers; a model over its calls for the minute rests 65 s, over
+     its calls for the day (20 a day per model on Free Tier) 6 h, so Ollama answers most of the day. Busy
      models are not skipped but asked last, and asked again after 2 and 5 s when all of them are busy.
      `thinking_level` low while the person waits, `GEMINI_THINKING` for the picture prepared ahead.
    - `Curator` (`CURATOR=claude`): Claude Opus 5.5 (effort medium, `fallbacks: "default"`), whole.
@@ -212,6 +213,14 @@ altrove + scala, minutes). Without a curator the title is "Da <first picture> a 
 "Salva nel diario" keeps it (`POST /api/journeys`, in `state/journeys.json`, git-ignored); the title
 can be changed before. `?view=diary`: journeys by month, newest first; `?journey=<id>`: the recap
 of one, a collection to start again from any step, or to take out of the diary.
+
+It is also an archive of attention (after FIELD.IO's Observatory: what you choose to notice is the
+personal material). Each step keeps the door's `box`, so the recap shows the detail that caught the
+eye, cut out of the picture before (`Detail`); the seconds its spread was the one in view while the
+page was visible (`dwell`, counted in `Flow`; the longest, when ≥ 20 s, is "il più a lungo"); and a
+line of the person's own ("Una riga tua", ≤ 280 characters), writable in the recap and later on the
+journey's page (`PUT /api/journeys/<id>/steps/<n>/note`). The recap prompt gets both and is told
+that's where the attention was; the diary shows a journey's first note.
 
 ## Concepts: what a detail is (`/api/concepts`, `/api/concept`)
 

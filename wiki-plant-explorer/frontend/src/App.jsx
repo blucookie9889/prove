@@ -777,6 +777,19 @@ function Flow({ route, preview, cardHandlers, onKept }) {
   const sections = useRef(new Map());
   const count = useRef(1);
 
+  // The attention each picture got: seconds it was the spread in view, while the page was visible
+  // and the journey not yet ended.
+  const dwell = useRef(new Map());
+  const inView = useRef(null);
+  inView.current = ending ? null : stream[active]?.key;
+  useEffect(() => {
+    const tick = setInterval(() => {
+      const k = inView.current;
+      if (k && document.visibilityState === "visible") dwell.current.set(k, (dwell.current.get(k) || 0) + 1);
+    }, 1000);
+    return () => clearInterval(tick);
+  }, []);
+
   useEffect(() => {
     const onSaved = (e) =>
       setStream((prev) => prev.map((p) => (p.item?.title === e.detail.title ? { ...p, item: { ...p.item, saved: e.detail.saved } } : p)));
@@ -936,9 +949,11 @@ function Flow({ route, preview, cardHandlers, onKept }) {
       .map((e) => ({
         title: e.title,
         item: e.item,
-        via: e.via && { title: e.via.title, leap: e.via.leap, anchor: e.via.anchor, hook: e.via.hook, url: e.via.url },
+        via: e.via && { title: e.via.title, leap: e.via.leap, anchor: e.via.anchor, hook: e.via.hook, url: e.via.url, box: e.via.box },
         seeing: e.data?.seeing || "",
         doors: e.data?.doors?.length || 0,
+        seconds: dwell.current.get(e.key) || 0,
+        note: "",
       })),
   });
 
@@ -961,6 +976,9 @@ function Flow({ route, preview, cardHandlers, onKept }) {
     }
   };
 
+  const setNote = (i, note) => setEnding((e) => ({ ...e, steps: e.steps.map((st, k) => (k === i ? { ...st, note } : st)) }));
+  const saveNote = (i) => ending.keptId && saveStepNote(ending.keptId, i, ending.steps[i].note);
+
   const back = () => {
     withTransition(() => setEnding(null));
     requestAnimationFrame(() => document.getElementById(stream[Math.max(0, active)]?.key)?.scrollIntoView({ block: "start" }));
@@ -973,6 +991,8 @@ function Flow({ route, preview, cardHandlers, onKept }) {
         writing={ending.writing}
         onTitle={ending.keptId ? null : (title) => setEnding((e) => ({ ...e, title }))}
         onOpenStep={(step) => cardHandlers.onOpen(step.item)}
+        onNote={setNote}
+        onNoteSave={saveNote}
         actions={
           ending.keptId ? (
             <>
@@ -1075,16 +1095,53 @@ function statsOf(stats) {
     [stats.concepts, stats.concepts === 1 ? "concetto" : "concetti"],
     far ? [far, far === 1 ? "salto lontano" : "salti lontani"] : null,
     [stats.minutes, stats.minutes === 1 ? "minuto" : "minuti"],
+    stats.notes ? [stats.notes, stats.notes === 1 ? "nota" : "note"] : null,
   ].filter(Boolean);
+}
+
+const lasted = (s) => (s < 60 ? `${Math.max(1, Math.round(s))} s` : `${Math.round(s / 60)} min`);
+
+function saveStepNote(id, i, note) {
+  return api(`/journeys/${id}/steps/${i}/note`, { method: "PUT", body: { note } }).catch(() =>
+    window.dispatchEvent(new CustomEvent("toast", { detail: "Non sono riuscito a salvare la nota" })),
+  );
+}
+
+/**
+ * The detail a door started from, cut out of the picture before at the box's own proportions: what
+ * caught the eye, kept beside where it led.
+ */
+function Detail({ item, box, h = 22 }) {
+  if (!item?.thumb || !box) return null;
+  const [x0, y0, x1, y1] = box;
+  const ratio = item.width && item.height ? ((x1 - x0) * item.width) / ((y1 - y0) * item.height) : 1;
+  const w = Math.round(Math.min(Math.max(h * ratio, h * 0.6), h * 2.4));
+  return (
+    <span className="relative inline-block shrink-0 overflow-hidden rounded-[4px] shadow-[inset_0_0_0_0.5px_rgb(29_28_26/0.12)]" style={{ width: w, height: h }}>
+      <img
+        src={item.thumb}
+        alt=""
+        className="absolute max-w-none"
+        style={{
+          width: `${100 / (x1 - x0)}%`,
+          height: `${100 / (y1 - y0)}%`,
+          left: `${(-x0 / (x1 - x0)) * 100}%`,
+          top: `${(-y0 / (y1 - y0)) * 100}%`,
+        }}
+      />
+    </span>
+  );
 }
 
 /**
  * A journey told back: the day, a title (the curator's, which can be changed before keeping it),
  * a few sentences on what ties the steps together, its numbers, then the trail itself as a
- * collection, step by step along a thread: each picture with the door that led to it.
+ * collection, step by step along a thread: each picture with the door that led to it, the detail
+ * that caught the eye, how long it held it, and a line of the person's own.
  */
-function Recap({ journey, writing, onTitle, onOpenStep, actions }) {
+function Recap({ journey, writing, onTitle, onOpenStep, onNote, onNoteSave, actions }) {
   const { steps, summary, stats, ended } = journey;
+  const lingered = stats?.lingered ?? null;
   return (
     <main className="mx-auto max-w-[720px] px-6 pt-12 pb-12">
       <p className="fade-in text-mute">{DAY.format(new Date((ended || Date.now() / 1000) * 1000))}</p>
@@ -1133,14 +1190,34 @@ function Recap({ journey, writing, onTitle, onOpenStep, actions }) {
               <img src={st.item.thumb} alt="" className="h-full w-full object-cover" />
             </button>
             <div className="min-w-0 pt-0.5">
-              <p className="flex gap-2 text-mute">
+              <p className="flex items-center gap-2 text-mute">
                 <span className="tabular-nums">{i + 1}</span>
+                {st.via?.box && <Detail item={steps[i - 1]?.item} box={st.via.box} />}
                 <span className="min-w-0 truncate">
                   {st.via ? `${st.via.leap}${st.via.anchor ? ` · ${st.via.anchor}` : ""}` : "partenza"}
                 </span>
+                {st.seconds >= 1 && (
+                  <span className={`ml-auto shrink-0 tabular-nums ${i === lingered ? "text-ink" : ""}`}>
+                    {i === lingered ? `il più a lungo · ${lasted(st.seconds)}` : lasted(st.seconds)}
+                  </span>
+                )}
               </p>
               <p className="text-ink first-letter:uppercase">{st.via ? st.via.title : prettyName(st.item.name)}</p>
               {st.via?.hook && <p className="text-ink-2">{st.via.hook}</p>}
+              {onNote ? (
+                <input
+                  value={st.note || ""}
+                  onChange={(e) => onNote(i, e.target.value)}
+                  onBlur={() => onNoteSave?.(i)}
+                  onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+                  maxLength={280}
+                  placeholder="Una riga tua"
+                  aria-label={`Nota sulla tappa ${i + 1}`}
+                  className="calm mt-1.5 w-full border-b border-transparent bg-transparent pb-0.5 text-ink outline-none transition-colors placeholder:text-mute/70 hover:border-rule focus:border-rule-2"
+                />
+              ) : (
+                st.note && <p className="mt-1.5 text-ink">“{st.note}”</p>
+              )}
               <button
                 type="button"
                 onClick={() => onOpenStep(st)}
@@ -1195,6 +1272,7 @@ function Diary({ onOpen }) {
                 <span className="calm min-w-0 transition-transform group-hover:translate-x-[3px]">
                   <span className="block text-ink first-letter:uppercase">{j.title}</span>
                   {j.summary && <span className="line-clamp-2 text-ink-2">{j.summary}</span>}
+                  {j.note && <span className="mt-1 block truncate text-ink">“{j.note}”</span>}
                   <span className="mt-1 block text-mute">{statsOf(j.stats).map(([n, w]) => `${n} ${w}`).join(" · ")}</span>
                 </span>
                 <span className="col-start-2 flex gap-1 md:col-start-3">
@@ -1230,6 +1308,8 @@ function JourneyPage({ id, cardHandlers, onForgot }) {
       writing={false}
       onTitle={null}
       onOpenStep={(st) => cardHandlers.onOpen(st.item)}
+      onNote={(i, note) => setJ((x) => ({ ...x, steps: x.steps.map((st, k) => (k === i ? { ...st, note } : st)) }))}
+      onNoteSave={(i) => saveStepNote(id, i, j.steps[i].note)}
       actions={
         <>
           <button type="button" className="link text-ink" onClick={() => cardHandlers.onOpen(lastStep.item)}>

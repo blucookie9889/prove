@@ -1701,6 +1701,8 @@ async def vote(v: Vote):
 # A journey is the flow of one session: the pictures in the order they were met, each with the door
 # (concept) that led to it. Ending it writes a recap (a title and a few sentences on what ties the
 # steps together); keeping it puts it in the diary, where it can be reopened as a collection.
+# It is also an archive of attention: for each step the detail that stopped the person (the door's
+# box on the picture before), how long they stayed, and a line of their own if they wrote one.
 
 LEAP_NAMES = {"dentro": "dentro", "perché": "perché", "altrove": "altrove", "scala": "di scala", "storia": "storia"}
 
@@ -1708,9 +1710,11 @@ LEAP_NAMES = {"dentro": "dentro", "perché": "perché", "altrove": "altrove", "s
 class JourneyStep(BaseModel):
     title: str
     item: dict
-    via: Optional[dict] = None  # the door that led here: title, leap, anchor, hook, url
+    via: Optional[dict] = None  # the door that led here: title, leap, anchor, hook, url, box (on the picture before)
     seeing: str = ""  # what the curator saw in the picture
     doors: int = 0  # how many doors it offered
+    seconds: float = 0  # how long the picture was the one in view
+    note: str = ""  # a line of the person's own
 
 
 class JourneyIn(BaseModel):
@@ -1733,6 +1737,10 @@ def journey_stats(j: JourneyIn) -> dict:
         "doors_seen": sum(s.doors for s in j.steps),
         "leaps": leaps,
         "minutes": max(1, round((ended - j.started) / 60)),
+        "notes": sum(1 for s in j.steps if s.note.strip()),
+        # The step looked at longest, when it clearly stands out (not on a journey of quick glances)
+        "lingered": max(range(len(j.steps)), key=lambda i: j.steps[i].seconds)
+        if j.steps and max(s.seconds for s in j.steps) >= 20 else None,
     }
 
 
@@ -1741,6 +1749,10 @@ def recap_prompt(j: JourneyIn) -> str:
     for n, s in enumerate(j.steps, 1):
         name = (s.item.get("name") or s.title.removeprefix("File:")).rsplit(".", 1)[0]
         seen = f" (mostrava: {s.seeing})" if s.seeing else ""
+        if s.seconds >= 20:
+            seen += f" Ci si è fermata {round(s.seconds)} secondi."
+        if s.note.strip():
+            seen += f' Ha scritto: "{s.note.strip()}".'
         if s.via:
             via = s.via
             lines.append(f'{n}. Dal dettaglio "{via.get("anchor") or "?"}" ({via.get("leap") or "?"}) al concetto '
@@ -1758,7 +1770,8 @@ def recap_prompt(j: JourneyIn) -> str:
         "- poi 2 o 3 frasi in seconda persona che raccontano il filo che lega le tappe: da dove sei partito, il "
         "salto più inatteso, che cosa hanno in comune cose così lontane. Tono asciutto e curioso, come un buon "
         "curatore di museo. Niente elenchi, niente punti esclamativi, niente aggettivi come affascinante o "
-        "straordinario, niente frasi sul viaggio o sull'esplorazione in sé."
+        "straordinario, niente frasi sul viaggio o sull'esplorazione in sé. Se la persona si è fermata a lungo "
+        "su una tappa o ha scritto qualcosa, è lì che stava la sua attenzione: tienine conto, senza citarla alla lettera."
     )
 
 
@@ -1802,7 +1815,7 @@ async def journey_keep(j: JourneyIn):
         "summary": j.summary.strip(),
         "started": j.started,
         "ended": j.ended or time.time(),
-        "steps": [{**s.dict(), "item": clean(s.item)} for s in j.steps],
+        "steps": [{**s.dict(), "note": s.note.strip()[:280], "item": clean(s.item)} for s in j.steps],
         "stats": journey_stats(j),
     }
     S["journeys"].append(entry)
@@ -1816,7 +1829,8 @@ async def journeys():
     out = []
     for e in sorted(S["journeys"], key=lambda e: -e["ended"]):
         out.append({k: e[k] for k in ("id", "title", "summary", "started", "ended", "stats")}
-                   | {"thumbs": [s["item"].get("thumb") for s in e["steps"][:6]]})
+                   | {"thumbs": [s["item"].get("thumb") for s in e["steps"][:6]],
+                      "note": next((s["note"] for s in e["steps"] if (s.get("note") or "").strip()), "")})
     return {"items": out}
 
 
@@ -1826,6 +1840,22 @@ async def journey(jid: str):
     if not entry:
         raise HTTPException(404, "Percorso non trovato")
     return {**entry, "steps": [{**s, "item": with_saved_flag([s["item"]])[0]} for s in entry["steps"]]}
+
+
+class StepNote(BaseModel):
+    note: str
+
+
+@app.put("/api/journeys/{jid}/steps/{n}/note")
+async def journey_note(jid: str, n: int, body: StepNote):
+    """A line of the person's own on one step of a kept journey: the diary stays theirs to write in."""
+    entry = next((e for e in S["journeys"] if e["id"] == jid), None)
+    if not entry or not 0 <= n < len(entry["steps"]):
+        raise HTTPException(404, "Tappa non trovata")
+    entry["steps"][n]["note"] = body.note.strip()[:280]
+    entry["stats"]["notes"] = sum(1 for st in entry["steps"] if (st.get("note") or "").strip())
+    save_journeys()
+    return {"ok": True}
 
 
 @app.delete("/api/journeys/{jid}")

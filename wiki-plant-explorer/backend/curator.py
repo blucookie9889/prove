@@ -539,7 +539,9 @@ class GeminiCurator(Engine):
         ends first before the others, so that when all of them are busy at once someone is still asked."""
         now = time.time()
         fresh = [m for m in self.models if now >= self.rested.get(m, 0)]
-        tired = sorted((m for m in self.models if now < self.rested.get(m, 0)), key=lambda m: self.rested[m])
+        # ...but not those out of their calls for the day: asking them only costs time
+        tired = sorted((m for m in self.models if now < self.rested.get(m, 0) <= now + self.BUSY_REST),
+                       key=lambda m: self.rested[m])
         return fresh + tired
 
     async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
@@ -650,7 +652,8 @@ class GeminiCurator(Engine):
                     if resp.status_code == 402:
                         self.off_until = time.time() + 15 * 60
                     elif resp.status_code == 429:
-                        self.rested[model] = time.time() + 65  # free calls are limited per minute
+                        # Free calls are limited per minute and per day (20 a day on Free Tier, 2026-11)
+                        self.rested[model] = time.time() + (6 * 3600 if "per day" in text else 65)
                     if resp.status_code in (429, 500, 503, 504):
                         yield ("busy", None)
                     return
