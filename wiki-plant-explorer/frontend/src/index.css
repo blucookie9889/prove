@@ -1,17 +1,21 @@
 @import "tailwindcss";
 
-/* Art direction: warm paper, one size, two tones, slow and calm. No shadows, no accent colour. */
+/* Art direction (after ProtoÉditions, 2026-11): white paper, soft grey panels with 8px corners, a
+   neutral ink, small type, pictures annotated like technical plates (hairlines, tiny mono labels).
+   One accent, an acid lime, only for what is active or the one thing to do. No shadows. */
 @theme {
   --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "Geist Mono", ui-monospace, "SF Mono", monospace;
-  --color-paper: #fdfdfc;
-  --color-ink: #1d1c1a;
-  --color-ink-2: #55534d;
-  --color-mute: #a19e97;
-  --color-rule: #eeece7;
-  --color-rule-2: #e6e3dd;
-  --color-underline: #dcd9d2;
-  --color-wash: #f1efeb;
+  --color-paper: #ffffff;
+  --color-ink: #1c1c1e;
+  --color-ink-2: #5a5a60;
+  --color-mute: #a6a6ab;
+  --color-rule: #ededf0;
+  --color-rule-2: #e2e2e6;
+  --color-underline: #d4d4d9;
+  --color-wash: #f3f3f5;
+  --color-panel: #f3f3f5;
+  --color-lime: #c7fb85;
   --ease-calm: cubic-bezier(0.16, 1, 0.3, 1);
   /* A soft spring: a hair past the mark, then settled */
   --ease-settle: linear(0, 0.11 3.5%, 0.4 9%, 0.7 15%, 0.9 21.5%, 1.012 29%, 1.03 35%, 1.022 43%, 1.006 55%, 0.999 70%, 1);
@@ -26,7 +30,7 @@ body,
 body {
   background: var(--color-paper);
   color: var(--color-ink);
-  font: 400 15px/1.6 var(--font-sans);
+  font: 400 14px/1.5 var(--font-sans);
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
   text-wrap: pretty;
@@ -34,7 +38,7 @@ body {
 }
 
 ::selection {
-  background: #ecebe6;
+  background: var(--color-lime);
 }
 
 /* Links and link-like buttons: only the underline darkens, never the text. */
@@ -121,10 +125,57 @@ a:hover,
   to { opacity: 1; filter: blur(0); }
 }
 
-/* Image placeholder: warm fill with a faint 135° hairline stripe */
+/* Image placeholder: the panel grey with a faint 135° hairline stripe */
 .placeholder {
-  background-color: var(--color-wash);
-  background-image: repeating-linear-gradient(135deg, transparent 0 9px, rgba(29, 28, 26, 0.035) 9px 10px);
+  background-color: var(--color-panel);
+  background-image: repeating-linear-gradient(135deg, transparent 0 9px, rgba(28, 28, 30, 0.03) 9px 10px);
+}
+
+/* Pills: actions and places, as soft grey buttons with 8px corners; the active one (or the one thing
+   to do) in lime. */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+  background: var(--color-panel);
+  color: var(--color-ink);
+  white-space: nowrap;
+  text-decoration: none; /* a link as a pill: the rule on a (unlayered) would beat a utility */
+  transition: background-color 0.5s var(--ease-calm), color 0.5s var(--ease-calm);
+  cursor: pointer;
+}
+.pill:hover {
+  background: var(--color-rule-2);
+}
+.pill.is-quiet {
+  color: var(--color-mute);
+}
+.pill.is-quiet:hover {
+  color: var(--color-ink);
+}
+.pill.is-on,
+.pill.is-go {
+  background: var(--color-lime);
+  color: var(--color-ink);
+}
+.pill.is-go:hover {
+  background: #b9f56d;
+}
+.pill:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Tiny technical type: labels on pictures, coordinates, counts */
+.tech {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 12px;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
 }
 
 /* The ambient dot: breathes slowly. Also marks the things in an image. */
@@ -136,33 +187,12 @@ a:hover,
   50% { opacity: 0.2; }
 }
 
-/* Liquid glass, for what floats over the content (the header, the tag on a picture, the toast):
-   what lies under it shows through blurred and a little more saturated, a faint white body keeps
-   text legible over any picture, and a hairline rim catches the light at the top left and, more
-   faintly, at the bottom right, as an edge of glass does. No tint, no colour of its own. */
+/* What floats over the content (the trail, the toast): the panel grey, a little see-through and
+   blurred so the page is felt under it. Flat: no rim, no shadow. */
 .glass {
-  isolation: isolate; /* positioned by whoever uses it: the rim needs a positioned parent */
-  background: linear-gradient(180deg, rgb(255 255 255 / 0.72), rgb(255 255 255 / 0.56));
-  -webkit-backdrop-filter: blur(16px) saturate(1.7) brightness(1.04);
-  backdrop-filter: blur(16px) saturate(1.7) brightness(1.04);
-  box-shadow:
-    inset 0 0.5px 0 rgb(255 255 255 / 0.95),
-    0 0 0 0.5px rgb(29 28 26 / 0.07),
-    0 1px 2px rgb(29 28 26 / 0.05),
-    0 10px 30px -14px rgb(29 28 26 / 0.28);
-}
-.glass::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  padding: 1px;
-  border-radius: inherit;
-  background: linear-gradient(135deg, rgb(255 255 255 / 0.95), rgb(255 255 255 / 0.15) 32%, rgb(255 255 255 / 0) 55%, rgb(255 255 255 / 0.45));
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
-  pointer-events: none;
+  background: rgb(243 243 245 / 0.84);
+  -webkit-backdrop-filter: blur(18px) saturate(1.3);
+  backdrop-filter: blur(18px) saturate(1.3);
 }
 
 /* A detail lifted off its picture. The box is registered so the lift glides between details; the
@@ -192,9 +222,8 @@ a:hover,
   width: calc((var(--x1) - var(--x0)) * 100%);
   height: calc((var(--y1) - var(--y0)) * 100%);
   overflow: hidden;
-  border-radius: 5px;
+  border-radius: 4px;
   opacity: 0;
-  box-shadow: 0 0.5px 1px rgb(29 28 26 / 0.25), 0 14px 34px -12px rgb(29 28 26 / 0.55);
   transition: opacity 0.3s var(--ease-calm), transform 0.6s var(--ease-settle);
 }
 .lift-detail::after {
@@ -202,7 +231,7 @@ a:hover,
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.45);
+  box-shadow: inset 0 0 0 1.5px var(--color-lime);
 }
 .lift-detail > img {
   position: absolute;
@@ -217,30 +246,61 @@ a:hover,
   opacity: 1;
   transform: scale(1.04);
 }
-.lift-tag {
+/* The doors drawn on their picture as on a technical plate: each detail framed by a hairline with
+   corner ticks, a tiny mono label at its corner (number, leap, where it sits). White over a faint dark
+   edge, so it reads on light and dark pictures alike. The door in hand turns lime; the others recede. */
+.marks {
   position: absolute;
-  left: calc(var(--x0) * 100%);
+  inset: 0;
+  z-index: 15;
+  pointer-events: none;
+}
+.mark-box {
+  position: absolute;
+  border: 0.5px solid rgb(255 255 255 / 0.75);
+  box-shadow: 0 0 0 0.5px rgb(0 0 0 / 0.12);
+  transition: opacity 0.6s var(--ease-calm), border-color 0.4s var(--ease-calm);
+  animation: mark-in 0.9s var(--ease-calm) both;
+}
+.mark-box::before,
+.mark-box::after {
+  content: "";
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  border-color: #fff;
+  border-style: solid;
+  filter: drop-shadow(0 0 0.5px rgb(0 0 0 / 0.35));
+}
+.mark-box::before { left: -1.5px; top: -1.5px; border-width: 1.5px 0 0 1.5px; }
+.mark-box::after { right: -1.5px; bottom: -1.5px; border-width: 0 1.5px 1.5px 0; }
+.mark-label {
+  position: absolute;
   display: flex;
-  gap: 7px;
-  max-width: 68%;
-  padding: 3px 9px;
-  border-radius: 8px;
+  gap: 6px;
+  max-width: 70%;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: rgb(255 255 255 / 0.86);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
   color: var(--color-ink);
-  font-size: 13px;
-  line-height: 1.45;
   white-space: nowrap;
-  opacity: 0;
-  transition: opacity 0.25s var(--ease-calm);
+  pointer-events: auto;
+  cursor: pointer;
+  transition: opacity 0.6s var(--ease-calm), background-color 0.4s var(--ease-calm);
+  animation: mark-in 0.9s var(--ease-calm) both;
 }
-.lift-tag.is-below { top: calc(var(--y1) * 100% + 12px); --from: -4px; transform-origin: top left; }
-.lift-tag.is-above { bottom: calc((1 - var(--y0)) * 100% + 12px); transform-origin: bottom left; }
-.lift-tag.is-right { left: auto; right: calc((1 - var(--x1)) * 100%); transform-origin: top right; }
-.lift.is-on .lift-tag {
-  opacity: 1;
-  animation: tag-in 0.45s var(--ease-settle) 0.1s both;
-}
-@keyframes tag-in {
-  from { opacity: 0; transform: translateY(var(--from, 4px)) scale(0.97); filter: blur(2px); }
+.mark-label .where { color: var(--color-mute); }
+.marks.has-on .mark-box:not(.is-on),
+.marks.has-on .mark-label:not(.is-on) { opacity: 0.25; }
+.mark-box.is-on { border-color: var(--color-lime); }
+.mark-box.is-on::before,
+.mark-box.is-on::after { border-color: var(--color-lime); }
+.mark-label.is-on { background: var(--color-lime); }
+.mark-label.is-on .where { color: rgb(28 28 30 / 0.55); }
+@keyframes mark-in {
+  from { opacity: 0; }
 }
 
 /* The trail at the foot of the flow: it rises in with the first door followed, and each new step
@@ -347,8 +407,8 @@ input::placeholder {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .rise, .fade-in, .breathe, .open-in, .lift.is-on .lift-tag, .trail, .trail-step { animation: none; }
-  .lift, .lift-detail, .lift-tag { transition: opacity 0.3s; }
+  .rise, .fade-in, .breathe, .open-in, .trail, .trail-step, .mark-box, .mark-label { animation: none; }
+  .lift, .lift-detail { transition: opacity 0.3s; }
   .lift.is-on .lift-detail { transform: none; }
   .fold, .fold > div > *, .recede > *, .plus::after, a, .link { transition: none; }
 }

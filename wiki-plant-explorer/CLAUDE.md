@@ -40,8 +40,10 @@ state/feedback.json  votes, saved images and opened images ("views") (git-ignore
 state/crawler.json   crawler cursors, done categories, interest categories and queries (git-ignored)
 ```
 
-- UI language is Italian; look and motion follow the portfolio art direction (warm paper, Geist 15px,
-  two tones, hairlines, slow eased motion). Routes are URL params: `?q=`, `?flow=<title>` (`?file=`
+- UI language is Italian. Look (since 2026-11, after protoeditions.co): white paper, soft grey panels
+  and pills with 8px corners (`.pill`, `bg-panel`), Geist 14px, titles in capitals, tiny mono labels
+  (`.tech`), one acid lime (`--color-lime`) only for what is active or the one thing to do; motion stays
+  slow and eased. Routes are URL params: `?q=`, `?flow=<title>` (`?file=`
   opens the flow too), `?view=saved`, `?view=featured`.
 - Item titles: Commons keeps `File:...`; other collections use `cma:<id>`, `inat:<observation id>`,
   `unsplash:<id>`, `pexels:<id>`. `resolve(title)` looks any of them up again (index payload first,
@@ -192,9 +194,12 @@ Frontend (`Flow`, `Stimulus` in App.jsx): each picture is a spread, the picture 
 as large as the screen allows, with what the curator sees and the credits under it) and on the right
 the concept that led here (leap · detail, title, hook, Wikipedia's extract clamped) and "Da qui": the
 doors as rows (thumbnail, number, leap · detail, title, hook; ↓ marks the one scrolling takes;
-skeleton rows while they arrive). A door and its dot answer each other on hover: the picture dims and
-greys, its detail lifts off it (`Lift`: an undimmed crop, raised 4% with a soft shadow, the door's
-number and title on a tag), the other rows recede. One lift for all details: its box is four
+skeleton rows while they arrive). On the picture the doors are drawn as on a technical plate
+(`Marks`): each detail framed by a white hairline with corner ticks, and at its corner a tiny mono
+label (number, leap, x/y of its centre) that is the door's handle. A door and its mark answer each
+other on hover: the picture dims and greys, its detail lifts off it (`Lift`: an undimmed crop, raised
+4%, lime rim), its frame, label and row turn lime, the others recede. The concept you are in is a
+lime bar (title in capitals, leap · detail in tiny type), its hook in a grey panel. One lift for all details: its box is four
 registered CSS properties, so moving between doors it glides on a soft spring (`--ease-settle`).
 No line across the page. Clicking dives in: the row's thumbnail grows into the next spread (View Transition
 `dive`). Keys: 1-9 open that door of the spread in view, → the one scrolling would take. The next
