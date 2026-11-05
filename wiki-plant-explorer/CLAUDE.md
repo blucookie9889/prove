@@ -166,6 +166,8 @@ picture being worked out is followed, never asked for twice; finished ones are c
      demand spikes) or 429 the next one answers; a model over its calls for the minute rests 65 s, over
      its calls for the day (20 a day per model on Free Tier) 6 h, so Ollama answers most of the day. Busy
      models are not skipped but asked last, and asked again after 2 and 5 s when all of them are busy.
+     An answer cut short before any door (stream ending with no `interaction.completed`) counts as
+     busy: the next model looks again; `Fallback` asks the local model whenever no door came.
      `thinking_level` low while the person waits, `GEMINI_THINKING` for the picture prepared ahead.
    - `Curator` (`CURATOR=claude`): Claude Opus 5.5 (effort medium, `fallbacks: "default"`), whole.
    Boxes are normalised (thousandths or pixels). Run Ollama with `ollama serve` before the backend.

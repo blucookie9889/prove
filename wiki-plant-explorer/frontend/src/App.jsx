@@ -555,6 +555,8 @@ function prettyName(name) {
   if (!name) return "";
   const clean = name
     .replace(/\s+--\s.*$/, "")
+    // Phone camera names with date and time: "PXL 20210215 121246757.PORTRAIT", "IMG_20190801_123456"
+    .replace(/\b(?:DSCF?|IMG|MVIMG|VID|PXL|GOPR)[\s_-]?\d{8}[\s_-]\d{6,9}(?:\.(?:PORTRAIT|NIGHT|PANO|MP|LS)\b)*(?:~\d+)?/gi, "")
     .replace(/\b(?:DSCF?|IMG|DCIM|PXL|P|GOPR)[_-]?\d{3,}\b/gi, "")
     .replace(/\(\d{5,}\)/g, "")
     .replace(/^\d{2}[-_.]\d{2}(?:[-_.]\d{2})?[-_\s]+/, "")

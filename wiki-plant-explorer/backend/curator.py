@@ -498,12 +498,12 @@ class Fallback(Engine):
 
     async def stream(self, image: Image.Image, name: str, via: Optional[str], seen: list[str],
                      deep: bool = True) -> AsyncIterator[tuple[str, object]]:
-        answered = False
+        answered = False  # a door: what it saw alone (an answer cut short) is not an answer
         async for event in self.first.stream(image, name, via, seen, deep):
-            answered = True
+            answered = answered or event[0] == "door"
             yield event
         if not answered and self.then:
-            log.info("curator: %s answered nothing for %s, asking %s", self.first.model, name, self.then.model)
+            log.info("curator: %s gave no door for %s, asking %s", self.first.model, name, self.then.model)
             async for event in self.then.stream(image, name, via, seen, deep):
                 yield event
 
@@ -565,17 +565,24 @@ class GeminiCurator(Engine):
                     self.rested[model] = time.time() + self.BUSY_REST
                     await answer.aclose()
                     continue
-                if first == ("busy", None):
+                if first in (("busy", None), ("cut", None)):
                     if self.rested.get(model, 0) <= time.time() + 70:
                         again.append(model)  # busy, not over its calls for the minute
                     self.rested[model] = max(self.rested.get(model, 0), time.time() + self.BUSY_REST)
                     await answer.aclose()
                     continue
                 yield first
+                cut = False
                 async for event in answer:
-                    if event != ("busy", None):
+                    if event == ("cut", None):
+                        cut = True
+                    elif event != ("busy", None):
                         yield event
-                return
+                if not cut:
+                    return
+                # What it saw came, its doors did not: the next model looks again (its "seeing" replaces this one)
+                self.rested[model] = time.time() + self.BUSY_REST
+                again.append(model)
             if not again or pause is None:
                 return
             log.info("gemini curator: every model busy for %s, asking %s again", name, ", ".join(again))
@@ -643,6 +650,7 @@ class GeminiCurator(Engine):
         }
         answer = AnswerStream()
         usage: dict = {}
+        doors = 0
         try:
             async with self.http.stream("POST", self.URL, json=body) as resp:
                 if resp.status_code != 200:
@@ -668,17 +676,26 @@ class GeminiCurator(Engine):
                     kind = ev.get("event_type")
                     if kind == "step.delta" and (ev.get("delta") or {}).get("type") == "text":
                         for event in answer.feed(ev["delta"].get("text", "")):
+                            doors += event[0] == "door"
                             yield event
                     elif kind == "interaction.completed":
                         usage = (ev.get("interaction") or {}).get("usage") or {}
                     elif kind == "error":
                         log.warning("gemini curator: %s: error for %s: %s", model, name, str(ev)[:300])
-                        if answer.text:  # part of an answer came: keep it
+                        if doors:  # part of an answer came: keep its doors
                             return
-                        yield ("busy", None)  # overloaded after accepting the request: the next one
+                        yield ("cut" if answer.text else "busy", None)  # overloaded after accepting: the next one
                         return
         except httpx.HTTPError as exc:
             log.warning("gemini curator: connection error: %s", exc)
+            if answer.text and not doors:
+                yield ("cut", None)
+            return
+        if not usage and not doors:
+            # The stream ended mid-answer, with no error and before any door (seen with a busy
+            # gemini-3.6-flash: "seeing" cut mid-sentence): let the next model answer.
+            log.warning("gemini curator: %s: answer cut before any door for %s", model, name)
+            yield ("cut", None)
             return
         log.info("gemini curator %s, %s: %s in / %s out / %s thinking tokens%s", model, name, usage.get("total_input_tokens"),
                  usage.get("total_output_tokens"), usage.get("total_thought_tokens"), "" if deep else " (quick)")
